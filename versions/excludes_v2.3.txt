@@ -1,0 +1,21 @@
+# Default rsync excludes
+
+# macOS metadata
+.Spotlight-V100/
+.fseventsd/
+.Trashes/
+.Trash/
+
+# Caches
+Library/Caches/
+Library/Logs/
+
+# Development
+.git/
+node_modules/
+__pycache__/
+*.pyc
+
+# Temporary
+*.tmp
+*.swp

@@ -3,3 +3,7 @@ test.sh
 *~
 tests/TestDest/
 tests/TestSource/
+/run_backups.sh
+
+/.specstory
+/.cursorindexingignore
