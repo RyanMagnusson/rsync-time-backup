@@ -56,6 +56,7 @@ fn_display_usage() {
 	echo " --no-auto-expire       Disable automatically deleting backups when out of space. Instead an error"
 	echo "                        is logged, and the backup is aborted. (ExFAT mode never auto-deletes.)"
 	echo " --exclude-from FILE    Read rsync exclude patterns from FILE. May appear before or after paths."
+	echo " --resume-last          Add new and changed files to the snapshot named by latest.txt."
 	echo "                        Default, when present: $DEFAULT_EXCLUDE_FILE"
 	echo ""
 	echo "For more detailed help, please see the README file:"
@@ -299,6 +300,7 @@ AUTO_DELETE_LOG="1"
 LOG_TO_DEST="0"
 EXPIRATION_STRATEGY="1:1 30:7 365:30"
 AUTO_EXPIRE="1"
+RESUME_LAST="0"
 
 # ExFAT cannot represent Unix hard links, symlinks, owners, groups, permissions, or devices.
 # --copy-links stores the contents referenced by symlinks as normal files/directories.
@@ -377,6 +379,11 @@ while [ "$#" -gt 0 ]; do
 			;;
 		--no-auto-expire)
 			AUTO_EXPIRE="0"
+			shift
+			continue
+			;;
+		--resume-last)
+			RESUME_LAST="1"
 			shift
 			continue
 			;;
@@ -512,7 +519,7 @@ fi
 # Setup additional variables
 # -----------------------------------------------------------------------------
 
-fn_log_info "Version: 2.1 ExFAT compatible"
+fn_log_info "Version: 2.3 ExFAT compatible"
 fn_log_info "Hard links/link-dest: disabled"
 fn_log_info "Expiration: disabled; existing snapshots will not be deleted"
 
@@ -529,10 +536,21 @@ LATEST_FILE="$DEST_FOLDER/latest.txt"
 MYPID="$$"
 DEST=""
 
-# Resume an interrupted ExFAT snapshot when both marker files are present.
-if fn_state_exists "$INPROGRESS_FILE" && fn_state_exists "$LATEST_FILE"; then
+# Resume an interrupted ExFAT snapshot automatically. With --resume-last,
+# reuse the completed snapshot named by latest.txt even without backup.inprogress.
+if [ "$RESUME_LAST" = "1" ]; then
+	if ! fn_state_exists "$LATEST_FILE"; then
+		fn_log_error "--resume-last requested, but '$LATEST_FILE' does not exist."
+		exit 1
+	fi
 	RESUME_NAME=$(fn_state_read "$LATEST_FILE" | tr -d '\r\n')
+elif fn_state_exists "$INPROGRESS_FILE" && fn_state_exists "$LATEST_FILE"; then
+	RESUME_NAME=$(fn_state_read "$LATEST_FILE" | tr -d '\r\n')
+else
+	RESUME_NAME=""
+fi
 
+if [ -n "$RESUME_NAME" ]; then
 	# Repair files produced by an older quoting bug: timestamp followed by literal "n".
 	case "$RESUME_NAME" in
 		????-??-??-??????n) RESUME_NAME=${RESUME_NAME%n} ;;
@@ -548,7 +566,11 @@ if fn_state_exists "$INPROGRESS_FILE" && fn_state_exists "$LATEST_FILE"; then
 
 	if fn_dest_dir_exists "$DEST_FOLDER/$RESUME_NAME"; then
 		DEST="$DEST_FOLDER/$RESUME_NAME"
-		fn_log_warn "Resuming interrupted snapshot: $SSH_DEST_FOLDER_PREFIX$DEST"
+		if [ "$RESUME_LAST" = "1" ]; then
+			fn_log_warn "Resume-last enabled: updating existing snapshot $SSH_DEST_FOLDER_PREFIX$DEST"
+		else
+			fn_log_warn "Resuming interrupted snapshot: $SSH_DEST_FOLDER_PREFIX$DEST"
+		fi
 		# Rewrite latest.txt cleanly, removing any legacy trailing literal n.
 		fn_state_write "$RESUME_NAME" "$LATEST_FILE"
 	else
@@ -575,8 +597,8 @@ fi
 # -----------------------------------------------------------------------------
 # ExFAT resumable behavior
 # -----------------------------------------------------------------------------
-# Existing completed snapshots are never modified. If backup.inprogress exists,
-# the validated snapshot named by latest.txt is resumed in place.
+# Existing completed snapshots are modified only when --resume-last is requested.
+# Interrupted snapshots are still resumed automatically from backup.inprogress/latest.txt.
 
 # Run in a loop to handle the "No space left on device" logic.
 while : ; do
