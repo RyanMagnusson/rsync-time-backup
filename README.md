@@ -8,7 +8,8 @@ On macOS, it has a few disadvantages compared to Time Machine - in particular it
 
 ## Installation
 
-	git clone https://github.com/laurent22/rsync-time-backup
+	git clone https://github.com/RyanMagnusson/rsync-time-backup
+	cd rsync-time-backup
 
 ## Usage
 
@@ -34,6 +35,77 @@ On macOS, it has a few disadvantages compared to Time Machine - in particular it
 	                        After 365 days keep one backup every 30 days.
 	 --no-auto-expire       Disable automatically deleting backups when out of space. Instead an error
 	                        is logged, and the backup is aborted.
+
+## ExFAT backup variant
+
+This fork includes `rsync_tmbackup_exfat.sh` for destinations that do not
+support the hard links, symbolic links, or Unix metadata used by the standard
+script. The current implementation is the reconstructed v3.4 history
+described in [the changelog](CHANGELOG.md) and
+[version history](docs/version-history.md).
+
+The ExFAT variant creates a complete, independent timestamped snapshot on each
+normal run. It does not use hard links or `--link-dest`, and it never
+automatically expires or deletes older snapshots. This is safer for recovery,
+but it can consume substantially more space than the standard script.
+
+Before the first backup, create the destination and its safety marker:
+
+```sh
+mkdir -p "/Volumes/Backup"
+touch "/Volumes/Backup/backup.marker"
+```
+
+Then run:
+
+```sh
+bash ./rsync_tmbackup_exfat.sh "$HOME/Documents" "/Volumes/Backup"
+```
+
+Snapshots are stored in directories named `YYYY-MM-DD-HHMMSS`.
+`latest.txt` identifies the most recent or active snapshot, and
+`backup.inprogress` records an interrupted run. Running the same backup command
+again automatically resumes an interrupted snapshot.
+
+Use `--resume-last` only when you intentionally want to add new and changed
+files to the completed snapshot named by `latest.txt`:
+
+```sh
+bash ./rsync_tmbackup_exfat.sh --resume-last \
+  "$HOME/Documents" "/Volumes/Backup"
+```
+
+`--resume-last` does not make a new snapshot and does not remove files that
+were deleted from the source.
+
+### Exclusions
+
+Pass an rsync-compatible exclusion file explicitly:
+
+```sh
+bash ./rsync_tmbackup_exfat.sh \
+  --exclude-from "$HOME/backup-excludes.txt" \
+  "$HOME/Documents" "/Volumes/Backup"
+```
+
+The option may appear before or after the source and destination. A third
+positional exclude-file argument is retained for compatibility. If no explicit
+file is supplied, the script automatically uses
+`~/.config/rsync_tmbackup/excludes.txt` when that file exists.
+
+### ExFAT limitations and safety notes
+
+- Every normal run is a full copy; monitor free destination space.
+- Existing snapshots are not automatically expired when space runs out.
+- Symlinks are followed and their target contents are copied because ExFAT
+  cannot store Unix symlinks. A symlink may therefore copy content outside the
+  apparent source tree.
+- Unix ownership, groups, permissions, device files, hard links, and symlinks
+  cannot be preserved on ExFAT.
+- The destination must contain `backup.marker`; the script refuses to run
+  without it.
+- Treat `latest.txt` and `backup.inprogress` as backup state. Do not edit them
+  while a backup is running.
 
 ## Features
 
@@ -108,6 +180,22 @@ An option to disable the default behaviour to purge old backups when out of spac
 ## How to restore
 
 The script creates a backup in a regular directory so you can simply copy the files back to the original directory. You could do that with something like `rsync -aP /path/to/last/backup/ /path/to/restore/to/`. Consider using the `--dry-run` option to check what exactly is going to be copied. Use `--delete` if you also want to delete files that exist in the destination but not in the backup (obviously extra care must be taken when using this option).
+
+For an ExFAT backup, read the snapshot name from `latest.txt` or choose any
+timestamped snapshot directory, then copy directly from that directory. The
+snapshot contains ordinary files and does not require this script to restore.
+
+## Tests
+
+Run the ExFAT regression suite on a system with Bash and rsync:
+
+```sh
+tests/test_exfat.sh
+```
+
+The suite uses isolated temporary source and destination directories. It
+covers snapshot creation, explicit and default exclusions, interrupted-run
+resume, `--resume-last`, marker safety, and invalid resume state.
 
 ## Extensions
 
