@@ -103,35 +103,34 @@ snapshot as distinct from automatic recovery of an interrupted snapshot.
   `library/excludes.txt` appear to be example/runtime artifacts. Their exact
   provenance is not encoded in the mapping.
 
-## Proposed long-term repository structure
+## Repository structure after migration
 
-No files are moved or deleted by this documentation change. After the history
-is reviewed, a separate migration can target:
+The temporary `versions/`, `library/`, and mapping artifacts were removed
+after the reconstructed v2.1-v3.4 sequence was committed to the history of
+`rsync_tmbackup_exfat.sh`. They remain recoverable from Git. The maintained
+repository now targets:
 
 ```text
 .
 ├── rsync_tmbackup.sh
+├── rsync_tmbackup_exfat.sh
 ├── CHANGELOG.md
 ├── README.md
-├── LICENSE
 ├── docs/
-│   ├── version-history.md
-│   ├── design.md
-│   └── recovery.md
+│   └── version-history.md
 ├── examples/
 │   └── excludes.txt
 ├── tests/
-└── tools/
-    └── list-rename-bad-unicode-filenames.py
+│   └── test_exfat.sh
+└── list-rename-bad-unicode-filenames.py
 ```
 
-Recommended migration rules:
+Migration decisions:
 
-1. Select and rename the supported current script before removing archives.
-2. Move reusable sample exclusions to `examples/`; do not track live state
-   files such as `backup.inprogress` or `latest.txt`.
-3. Preserve historical scripts through Git history and optional release tags,
-   then remove `versions/`, `library/`, and the mapping in one separately
-   reviewed change.
-4. Tag only versions known to have been used as releases. Keep experiments
-   such as v2.3 documented without presenting them as supported releases.
+1. `rsync_tmbackup_exfat.sh` is the supported ExFAT script.
+2. The generic sample exclusions moved to `examples/excludes.txt`.
+3. Runtime state such as `backup.inprogress` and `latest.txt` is not tracked.
+4. Historical scripts are preserved in Git rather than duplicated in the
+   working tree.
+5. Experiments such as v2.3 remain documented without being presented as
+   supported releases.

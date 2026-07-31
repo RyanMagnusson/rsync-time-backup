@@ -92,6 +92,7 @@ The option may appear before or after the source and destination. A third
 positional exclude-file argument is retained for compatibility. If no explicit
 file is supplied, the script automatically uses
 `~/.config/rsync_tmbackup/excludes.txt` when that file exists.
+See [`examples/excludes.txt`](examples/excludes.txt) for a starter file.
 
 ### ExFAT limitations and safety notes
 

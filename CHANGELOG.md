@@ -11,6 +11,9 @@ for provenance, naming notes, and known ambiguities.
 
 - Normalized the supported ExFAT script's displayed project version to v3.4.
 - Marked `rsync_tmbackup_exfat.sh` executable for direct command-line use.
+- Removed the temporary `versions/`, `library/`, and mapping migration
+  artifacts after preserving their sequence in Git history.
+- Retained a concise, reusable exclusion-file example under `examples/`.
 
 ### Documentation
 

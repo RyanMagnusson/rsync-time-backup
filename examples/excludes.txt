@@ -1,12 +1,10 @@
-# Default rsync excludes
+# Example rsync exclusions
 
-# macOS metadata
+# macOS metadata and caches
 .Spotlight-V100/
 .fseventsd/
 .Trashes/
 .Trash/
-
-# Caches
 Library/Caches/
 Library/Logs/
 
@@ -16,6 +14,6 @@ node_modules/
 __pycache__/
 *.pyc
 
-# Temporary
+# Temporary files
 *.tmp
 *.swp
