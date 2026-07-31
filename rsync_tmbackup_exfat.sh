@@ -55,7 +55,7 @@ fn_display_usage() {
 	echo "                        After 365 days keep one backup every 30 days."
 	echo " --no-auto-expire       Disable automatically deleting backups when out of space. Instead an error"
 	echo "                        is logged, and the backup is aborted. (ExFAT mode never auto-deletes.)"
-	echo " --exclude-from FILE    Read rsync exclude patterns from FILE. Overrides the default file."
+	echo " --exclude-from FILE    Read rsync exclude patterns from FILE. May appear before or after paths."
 	echo "                        Default, when present: $DEFAULT_EXCLUDE_FILE"
 	echo ""
 	echo "For more detailed help, please see the README file:"
@@ -306,62 +306,86 @@ RSYNC_FLAGS="--copy-links --one-file-system --itemize-changes --times --recursiv
 DEFAULT_EXCLUDE_FILE="$HOME/.config/rsync_tmbackup/excludes.txt"
 EXCLUDE_FROM_FILE=""
 
-while :; do
-	case $1 in
+# Parse options in any order. The first two non-option arguments are
+# SOURCE and DESTINATION; a third non-option argument remains supported as
+# the legacy exclude-pattern-file.
+POSITIONAL_ARGS=()
+
+while [ "$#" -gt 0 ]; do
+	case "$1" in
 		-h|-\?|--help)
 			fn_display_usage
-			exit
+			exit 0
 			;;
 		-p|--port)
-			shift
-			SSH_PORT=$1
+			[ "$#" -ge 2 ] || { fn_log_error "$1 requires a value."; exit 1; }
+			SSH_PORT="$2"
+			shift 2
+			continue
 			;;
 		-i|--id_rsa)
-			shift
-			ID_RSA="$1"
+			[ "$#" -ge 2 ] || { fn_log_error "$1 requires a value."; exit 1; }
+			ID_RSA="$2"
+			shift 2
+			continue
 			;;
 		--rsync-get-flags)
-			shift
 			echo "$RSYNC_FLAGS"
-			exit
+			exit 0
 			;;
 		--rsync-set-flags)
-			shift
-			RSYNC_FLAGS="$1"
+			[ "$#" -ge 2 ] || { fn_log_error "$1 requires a value."; exit 1; }
+			RSYNC_FLAGS="$2"
+			shift 2
+			continue
 			;;
 		--rsync-append-flags)
-			shift
-			RSYNC_FLAGS="$RSYNC_FLAGS $1"
+			[ "$#" -ge 2 ] || { fn_log_error "$1 requires a value."; exit 1; }
+			RSYNC_FLAGS="$RSYNC_FLAGS $2"
+			shift 2
+			continue
 			;;
 		--exclude-from)
+			[ "$#" -ge 2 ] || { fn_log_error "--exclude-from requires a file path."; exit 1; }
+			EXCLUDE_FROM_FILE="$2"
+			shift 2
+			continue
+			;;
+		--exclude-from=*)
+			EXCLUDE_FROM_FILE="${1#*=}"
 			shift
-			if [ -z "$1" ]; then
-				fn_log_error "--exclude-from requires a file path."
-				exit 1
-			fi
-			EXCLUDE_FROM_FILE="$1"
+			continue
 			;;
 		--strategy)
-			shift
-			EXPIRATION_STRATEGY="$1"
+			[ "$#" -ge 2 ] || { fn_log_error "$1 requires a value."; exit 1; }
+			EXPIRATION_STRATEGY="$2"
+			shift 2
+			continue
 			;;
 		--log-dir)
-			shift
-			LOG_DIR="$1"
+			[ "$#" -ge 2 ] || { fn_log_error "$1 requires a value."; exit 1; }
+			LOG_DIR="$2"
 			AUTO_DELETE_LOG="0"
+			shift 2
+			continue
 			;;
 		--log-to-destination)
 			LOG_TO_DEST="1"
 			AUTO_DELETE_LOG="0"
+			shift
+			continue
 			;;
 		--no-auto-expire)
 			AUTO_EXPIRE="0"
+			shift
+			continue
 			;;
 		--)
 			shift
-			SRC_FOLDER="$1"
-			DEST_FOLDER="$2"
-			EXCLUSION_FILE="$3"
+			while [ "$#" -gt 0 ]; do
+				POSITIONAL_ARGS+=("$1")
+				shift
+			done
 			break
 			;;
 		-*)
@@ -371,14 +395,22 @@ while :; do
 			exit 1
 			;;
 		*)
-			SRC_FOLDER="$1"
-			DEST_FOLDER="$2"
-			EXCLUSION_FILE="$3"
-			break
+			POSITIONAL_ARGS+=("$1")
+			shift
+			continue
+			;;
 	esac
-
-	shift
 done
+
+SRC_FOLDER="${POSITIONAL_ARGS[0]:-}"
+DEST_FOLDER="${POSITIONAL_ARGS[1]:-}"
+EXCLUSION_FILE="${POSITIONAL_ARGS[2]:-}"
+
+if [ "${#POSITIONAL_ARGS[@]}" -gt 3 ]; then
+	fn_log_error "Too many positional arguments."
+	fn_display_usage
+	exit 1
+fi
 
 # Resolve exclude file precedence: explicit --exclude-from, legacy third argument, then default.
 if [ -z "$EXCLUDE_FROM_FILE" ] && [ -n "$EXCLUSION_FILE" ]; then
@@ -594,7 +626,7 @@ while : ; do
 	CMD="$CMD $RSYNC_FLAGS"
 	CMD="$CMD --log-file '$LOG_FILE'"
 	if [ -n "$EXCLUDE_FROM_FILE" ]; then
-		CMD="$CMD --exclude-from '$EXCLUDE_FROM_FILE'"
+		CMD="$CMD --exclude-from='$EXCLUDE_FROM_FILE'"
 	fi
 	CMD="$CMD $LINK_DEST_OPTION"
 	CMD="$CMD -- '$SSH_SRC_FOLDER_PREFIX$SRC_FOLDER/' '$SSH_DEST_FOLDER_PREFIX$DEST/'"
