@@ -54,6 +54,9 @@ fn_display_usage() {
 	echo "                        After 365 days keep one backup every 30 days."
 	echo " --no-auto-expire       Disable automatically deleting backups when out of space. Instead an error"
 	echo "                        is logged, and the backup is aborted."
+	echo " --exclude-from FILE    Read rsync exclude patterns from FILE. May appear before or after paths."
+	echo " --resume-last          Add new and changed files to the snapshot referenced by latest."
+	echo "                        Default exclude file, when present: $DEFAULT_EXCLUDE_FILE"
 	echo ""
 	echo "For more detailed help, please see the README file:"
 	echo ""
@@ -262,6 +265,18 @@ fn_df_t() {
 	fn_run_cmd "df -T '${1}'"
 }
 
+fn_dest_dir_exists() {
+	fn_run_cmd "test -d '$1'"
+}
+
+fn_symlink_exists() {
+	fn_run_cmd "test -L '$1'"
+}
+
+fn_readlink() {
+	fn_run_cmd "readlink '$1'"
+}
+
 # -----------------------------------------------------------------------------
 # Source and destination information
 # -----------------------------------------------------------------------------
@@ -283,57 +298,97 @@ AUTO_DELETE_LOG="1"
 LOG_TO_DEST="0"
 EXPIRATION_STRATEGY="1:1 30:7 365:30"
 AUTO_EXPIRE="1"
+RESUME_LAST="0"
 
-RSYNC_FLAGS="-D --numeric-ids --links --hard-links --one-file-system --itemize-changes --times --recursive --perms --owner --group --stats --human-readable"
+RSYNC_FLAGS="-D --numeric-ids --links --hard-links --one-file-system --itemize-changes --times --recursive --perms --owner --group --stats --human-readable --partial --partial-dir=.rsync-partial"
+DEFAULT_EXCLUDE_FILE="$HOME/.config/rsync_tmbackup/excludes.txt"
+EXCLUDE_FROM_FILE=""
 
-while :; do
-	case $1 in
+# Parse options in any order. The first two non-option arguments are
+# SOURCE and DESTINATION; a third non-option argument remains supported as
+# the legacy exclude-pattern-file.
+POSITIONAL_ARGS=()
+
+while [ "$#" -gt 0 ]; do
+	case "$1" in
 		-h|-\?|--help)
 			fn_display_usage
-			exit
+			exit 0
 			;;
 		-p|--port)
-			shift
-			SSH_PORT=$1
+			[ "$#" -ge 2 ] || { fn_log_error "$1 requires a value."; exit 1; }
+			SSH_PORT="$2"
+			shift 2
+			continue
 			;;
 		-i|--id_rsa)
-			shift
-			ID_RSA="$1"
+			[ "$#" -ge 2 ] || { fn_log_error "$1 requires a value."; exit 1; }
+			ID_RSA="$2"
+			shift 2
+			continue
 			;;
 		--rsync-get-flags)
-			shift
 			echo "$RSYNC_FLAGS"
-			exit
+			exit 0
 			;;
 		--rsync-set-flags)
-			shift
-			RSYNC_FLAGS="$1"
+			[ "$#" -ge 2 ] || { fn_log_error "$1 requires a value."; exit 1; }
+			RSYNC_FLAGS="$2"
+			shift 2
+			continue
 			;;
 		--rsync-append-flags)
+			[ "$#" -ge 2 ] || { fn_log_error "$1 requires a value."; exit 1; }
+			RSYNC_FLAGS="$RSYNC_FLAGS $2"
+			shift 2
+			continue
+			;;
+		--exclude-from)
+			[ "$#" -ge 2 ] || { fn_log_error "--exclude-from requires a file path."; exit 1; }
+			EXCLUDE_FROM_FILE="$2"
+			shift 2
+			continue
+			;;
+		--exclude-from=*)
+			EXCLUDE_FROM_FILE="${1#*=}"
 			shift
-			RSYNC_FLAGS="$RSYNC_FLAGS $1"
+			continue
 			;;
 		--strategy)
-			shift
-			EXPIRATION_STRATEGY="$1"
+			[ "$#" -ge 2 ] || { fn_log_error "$1 requires a value."; exit 1; }
+			EXPIRATION_STRATEGY="$2"
+			shift 2
+			continue
 			;;
 		--log-dir)
-			shift
-			LOG_DIR="$1"
+			[ "$#" -ge 2 ] || { fn_log_error "$1 requires a value."; exit 1; }
+			LOG_DIR="$2"
 			AUTO_DELETE_LOG="0"
+			shift 2
+			continue
 			;;
 		--log-to-destination)
 			LOG_TO_DEST="1"
 			AUTO_DELETE_LOG="0"
+			shift
+			continue
 			;;
 		--no-auto-expire)
 			AUTO_EXPIRE="0"
+			shift
+			continue
+			;;
+		--resume-last)
+			RESUME_LAST="1"
+			shift
+			continue
 			;;
 		--)
 			shift
-			SRC_FOLDER="$1"
-			DEST_FOLDER="$2"
-			EXCLUSION_FILE="$3"
+			while [ "$#" -gt 0 ]; do
+				POSITIONAL_ARGS+=("$1")
+				shift
+			done
 			break
 			;;
 		-*)
@@ -343,14 +398,43 @@ while :; do
 			exit 1
 			;;
 		*)
-			SRC_FOLDER="$1"
-			DEST_FOLDER="$2"
-			EXCLUSION_FILE="$3"
-			break
+			POSITIONAL_ARGS+=("$1")
+			shift
+			continue
+			;;
 	esac
-
-	shift
 done
+
+SRC_FOLDER="${POSITIONAL_ARGS[0]:-}"
+DEST_FOLDER="${POSITIONAL_ARGS[1]:-}"
+EXCLUSION_FILE="${POSITIONAL_ARGS[2]:-}"
+
+if [ "${#POSITIONAL_ARGS[@]}" -gt 3 ]; then
+	fn_log_error "Too many positional arguments."
+	fn_display_usage
+	exit 1
+fi
+
+# Resolve exclude file precedence: explicit --exclude-from, legacy third argument, then default.
+if [ -z "$EXCLUDE_FROM_FILE" ] && [ -n "$EXCLUSION_FILE" ]; then
+	EXCLUDE_FROM_FILE="$EXCLUSION_FILE"
+fi
+if [ -z "$EXCLUDE_FROM_FILE" ] && [ -f "$DEFAULT_EXCLUDE_FILE" ]; then
+	EXCLUDE_FROM_FILE="$DEFAULT_EXCLUDE_FILE"
+fi
+if [ -n "$EXCLUDE_FROM_FILE" ]; then
+	if [ ! -f "$EXCLUDE_FROM_FILE" ] || [ ! -r "$EXCLUDE_FROM_FILE" ]; then
+		fn_log_error "Exclude file '$EXCLUDE_FROM_FILE' does not exist or is not readable."
+		exit 1
+	fi
+	EXCLUDE_PATTERN_COUNT=$(awk 'BEGIN{n=0} /^[[:space:]]*($|#)/{next} {n++} END{print n}' "$EXCLUDE_FROM_FILE")
+	fn_log_info "Exclude file: $EXCLUDE_FROM_FILE"
+	fn_log_info "Active exclude patterns: $EXCLUDE_PATTERN_COUNT"
+else
+	fn_log_info "Exclude file: none"
+	fn_log_info "Active exclude patterns: 0"
+	fn_log_warn "No files or folders will be excluded."
+fi
 
 # Display usage information if required arguments are not passed
 if [[ -z "$SRC_FOLDER" || -z "$DEST_FOLDER" ]]; then
@@ -386,7 +470,7 @@ fi
 # Now strip off last slash from source folder.
 SRC_FOLDER="${SRC_FOLDER%/}"
 
-for ARG in "$SRC_FOLDER" "$DEST_FOLDER" "$EXCLUSION_FILE"; do
+for ARG in "$SRC_FOLDER" "$DEST_FOLDER" "$EXCLUDE_FROM_FILE"; do
 	if [[ "$ARG" == *"'"* ]]; then
 		fn_log_error 'Source and destination directories may not contain single quote characters.'
 		exit 1
@@ -441,7 +525,35 @@ export IFS=$'\n' # Better for handling spaces in filenames.
 DEST="$DEST_FOLDER/$NOW"
 PREVIOUS_DEST="$(fn_find_backups | head -n 1)"
 INPROGRESS_FILE="$DEST_FOLDER/backup.inprogress"
+LATEST_LINK="$DEST_FOLDER/latest"
 MYPID="$$"
+
+if [ "$RESUME_LAST" = "1" ]; then
+	if [ -n "$(fn_find "$INPROGRESS_FILE")" ]; then
+		fn_log_error "--resume-last cannot be used while an interrupted backup is pending."
+		fn_log_error "Run the same command without --resume-last to recover it first."
+		exit 1
+	fi
+	if ! fn_symlink_exists "$LATEST_LINK"; then
+		fn_log_error "--resume-last requested, but '$LATEST_LINK' does not exist."
+		exit 1
+	fi
+	RESUME_NAME="$(fn_readlink "$LATEST_LINK" | tr -d '\r\n')"
+	case "$RESUME_NAME" in
+		????-??-??-??????) ;;
+		*)
+			fn_log_error "Cannot resume: '$LATEST_LINK' does not reference a valid timestamped snapshot."
+			exit 1
+			;;
+	esac
+	if ! fn_dest_dir_exists "$DEST_FOLDER/$RESUME_NAME"; then
+		fn_log_error "Cannot resume: snapshot directory '$DEST_FOLDER/$RESUME_NAME' does not exist."
+		exit 1
+	fi
+	DEST="$DEST_FOLDER/$RESUME_NAME"
+	PREVIOUS_DEST=""
+	fn_log_warn "Resume-last enabled: updating existing snapshot $SSH_DEST_FOLDER_PREFIX$DEST"
+fi
 
 # -----------------------------------------------------------------------------
 # Create log folder if it doesn't exist
@@ -460,7 +572,7 @@ fi
 # Handle case where a previous backup failed or was interrupted.
 # -----------------------------------------------------------------------------
 
-if [ -n "$(fn_find "$INPROGRESS_FILE")" ]; then
+if [ "$RESUME_LAST" != "1" ] && [ -n "$(fn_find "$INPROGRESS_FILE")" ]; then
 	if [ "$OSTYPE" == "cygwin" ]; then
 		# 1. Grab the PID of previous run from the PID file
 		RUNNINGPID="$(fn_run_cmd "cat $INPROGRESS_FILE")"
@@ -537,12 +649,14 @@ while : ; do
 	# Purge certain old backups before beginning new backup.
 	# -----------------------------------------------------------------------------
 
-	if [ -n "$PREVIOUS_DEST" ]; then
-		# regardless of expiry strategy keep backup used for --link-dest
-		fn_expire_backups "$PREVIOUS_DEST"
-	else
-		# keep latest backup
-		fn_expire_backups "$DEST"
+	if [ "$RESUME_LAST" != "1" ]; then
+		if [ -n "$PREVIOUS_DEST" ]; then
+			# regardless of expiry strategy keep backup used for --link-dest
+			fn_expire_backups "$PREVIOUS_DEST"
+		else
+			# keep latest backup
+			fn_expire_backups "$DEST"
+		fi
 	fi
 
 	# -----------------------------------------------------------------------------
@@ -566,9 +680,8 @@ while : ; do
 	fi
 	CMD="$CMD $RSYNC_FLAGS"
 	CMD="$CMD --log-file '$LOG_FILE'"
-	if [ -n "$EXCLUSION_FILE" ]; then
-		# We've already checked that $EXCLUSION_FILE doesn't contain a single quote
-		CMD="$CMD --exclude-from '$EXCLUSION_FILE'"
+	if [ -n "$EXCLUDE_FROM_FILE" ]; then
+		CMD="$CMD --exclude-from='$EXCLUDE_FROM_FILE'"
 	fi
 	CMD="$CMD $LINK_DEST_OPTION"
 	CMD="$CMD -- '$SSH_SRC_FOLDER_PREFIX$SRC_FOLDER/' '$SSH_DEST_FOLDER_PREFIX$DEST/'"

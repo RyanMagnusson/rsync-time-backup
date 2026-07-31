@@ -14,6 +14,15 @@ for provenance, naming notes, and known ambiguities.
 - Removed the temporary `versions/`, `library/`, and mapping migration
   artifacts after preserving their sequence in Git history.
 - Retained a concise, reusable exclusion-file example under `examples/`.
+- Brought the standard script's command-line surface into parity with the
+  ExFAT script: order-independent options, explicit/default exclusions,
+  partial-transfer retention, and `--resume-last`.
+
+### Added
+
+- Added standard-filesystem regression coverage for hard-linked incrementals,
+  interrupted recovery, exclusions, `--resume-last`, safety checks, and flag
+  parity with the ExFAT script.
 
 ### Documentation
 

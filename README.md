@@ -35,6 +35,13 @@ On macOS, it has a few disadvantages compared to Time Machine - in particular it
 	                        After 365 days keep one backup every 30 days.
 	 --no-auto-expire       Disable automatically deleting backups when out of space. Instead an error
 	                        is logged, and the backup is aborted.
+	 --exclude-from FILE    Read rsync exclude patterns from FILE. May appear before or after paths.
+	 --resume-last          Add new and changed files to the snapshot referenced by latest.
+
+The standard and ExFAT scripts accept the same command-line flags. Their
+storage behavior remains intentionally different: the standard script uses
+hard-linked incremental snapshots and expiration, while the ExFAT script uses
+independent full snapshots and never automatically deletes them.
 
 ## ExFAT backup variant
 
@@ -188,15 +195,17 @@ snapshot contains ordinary files and does not require this script to restore.
 
 ## Tests
 
-Run the ExFAT regression suite on a system with Bash and rsync:
+Run both regression suites on a system with Bash and rsync:
 
 ```sh
+tests/test_standard.sh
 tests/test_exfat.sh
 ```
 
-The suite uses isolated temporary source and destination directories. It
-covers snapshot creation, explicit and default exclusions, interrupted-run
-resume, `--resume-last`, marker safety, and invalid resume state.
+The suites use isolated temporary source and destination directories. They
+cover full and hard-linked incremental snapshots, explicit and default
+exclusions, interrupted-run resume, `--resume-last`, marker safety, invalid
+resume state, and command-line flag parity.
 
 ## Extensions
 
