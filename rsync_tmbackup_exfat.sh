@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 
 APPNAME=$(basename "$0" | sed "s/\.sh$//")
+# ExFAT one-shot timestamped snapshot variant: full copies, no hard links/symlinks/expiry.
 
 # -----------------------------------------------------------------------------
 # Log functions
@@ -284,7 +285,10 @@ LOG_TO_DEST="0"
 EXPIRATION_STRATEGY="1:1 30:7 365:30"
 AUTO_EXPIRE="1"
 
-RSYNC_FLAGS="-D --numeric-ids --links --hard-links --one-file-system --itemize-changes --times --recursive --perms --owner --group --stats --human-readable"
+# ExFAT cannot represent Unix hard links, symlinks, owners, groups, permissions, or devices.
+# --copy-links stores the contents referenced by symlinks as normal files/directories.
+RSYNC_FLAGS="--copy-links --one-file-system --itemize-changes --times --recursive --stats --human-readable --modify-window=2"
+DEFAULT_EXCLUDE_FILE="$HOME/.config/rsync_tmbackup/excludes.txt"
 EXCLUDE_FROM_FILE=""
 
 while :; do
@@ -398,7 +402,7 @@ done
 # Check that the destination drive is a backup drive
 # -----------------------------------------------------------------------------
 
-# TODO: check that the destination supports hard links
+# ExFAT variant: hard links are intentionally not used.
 
 fn_backup_marker_path() { echo "$1/backup.marker"; }
 fn_find_backup_marker() { fn_find "$(fn_backup_marker_path "$1")" 2>/dev/null; }
@@ -440,7 +444,7 @@ KEEP_DAILIES_DATE=$((EPOCH - 2678400)) # 31 days ago
 
 export IFS=$'\n' # Better for handling spaces in filenames.
 DEST="$DEST_FOLDER/$NOW"
-PREVIOUS_DEST="$(fn_find_backups | head -n 1)"
+PREVIOUS_DEST=""  # ExFAT variant always creates a full independent snapshot
 INPROGRESS_FILE="$DEST_FOLDER/backup.inprogress"
 MYPID="$$"
 
@@ -458,53 +462,13 @@ if [ ! -d "$LOG_DIR" ]; then
 fi
 
 # -----------------------------------------------------------------------------
-# Handle case where a previous backup failed or was interrupted.
+# ExFAT one-shot behavior
 # -----------------------------------------------------------------------------
-
+# Do not resume by renaming/moving any previous timestamped backup. A stale
+# backup.inprogress from the original hard-link script is ignored and replaced
+# for this run. Existing snapshot directories are never modified here.
 if [ -n "$(fn_find "$INPROGRESS_FILE")" ]; then
-	if [ "$OSTYPE" == "cygwin" ]; then
-		# 1. Grab the PID of previous run from the PID file
-		RUNNINGPID="$(fn_run_cmd "cat $INPROGRESS_FILE")"
-
-		# 2. Get the command for the process currently running under that PID and look for our script name
-		RUNNINGCMD="$(procps -wwfo cmd -p $RUNNINGPID --no-headers | grep "$APPNAME")"
-
-		# 3. Grab the exit code from grep (0=found, 1=not found)
-		GREPCODE=$?
-
-		# 4. if found, assume backup is still running
-		if [ "$GREPCODE" = 0 ]; then
-			fn_log_error "Previous backup task is still active - aborting (command: $RUNNINGCMD)."
-			exit 1
-		fi
-	elif [[ "$OSTYPE" == "netbsd"* ]]; then
-		RUNNINGPID="$(fn_run_cmd "cat $INPROGRESS_FILE")"
-		if ps -axp "$RUNNINGPID" -o "command" | grep "$APPNAME" > /dev/null; then
-			fn_log_error "Previous backup task is still active - aborting."
-			exit 1
-		fi
-	else
-		RUNNINGPID="$(fn_run_cmd "cat $INPROGRESS_FILE")"
-		if ps -p "$RUNNINGPID" -o command | grep "$APPNAME"
-		then
-			fn_log_error "Previous backup task is still active - aborting."
-			exit 1
-		fi
-	fi
-
-	if [ -n "$PREVIOUS_DEST" ]; then
-		# - Last backup is moved to current backup folder so that it can be resumed.
-		# - 2nd to last backup becomes last backup.
-		fn_log_info "$SSH_DEST_FOLDER_PREFIX$INPROGRESS_FILE already exists - the previous backup failed or was interrupted. Backup will resume from there."
-		fn_run_cmd "mv -- $PREVIOUS_DEST $DEST"
-		if [ "$(fn_find_backups | wc -l)" -gt 1 ]; then
-			PREVIOUS_DEST="$(fn_find_backups | sed -n '2p')"
-		else
-			PREVIOUS_DEST=""
-		fi
-		# update PID to current process to avoid multiple concurrent resumes
-		fn_run_cmd "echo $MYPID > $INPROGRESS_FILE"
-	fi
+	fn_log_warn "Ignoring stale $SSH_DEST_FOLDER_PREFIX$INPROGRESS_FILE from an earlier run; existing snapshots will not be moved."
 fi
 
 # Run in a loop to handle the "No space left on device" logic.
@@ -515,15 +479,7 @@ while : ; do
 	# -----------------------------------------------------------------------------
 
 	LINK_DEST_OPTION=""
-	if [ -z "$PREVIOUS_DEST" ]; then
-		fn_log_info "No previous backup - creating new one."
-	else
-		# If the path is relative, it needs to be relative to the destination. To keep
-		# it simple, just use an absolute path. See http://serverfault.com/a/210058/118679
-		PREVIOUS_DEST="$(fn_get_absolute_path "$PREVIOUS_DEST")"
-		fn_log_info "Previous backup found - doing incremental backup from $SSH_DEST_FOLDER_PREFIX$PREVIOUS_DEST"
-		LINK_DEST_OPTION="--link-dest='$PREVIOUS_DEST'"
-	fi
+	fn_log_info "Creating a full independent ExFAT snapshot (hard links/link-dest disabled)."
 
 	# -----------------------------------------------------------------------------
 	# Create destination folder if it doesn't already exists
@@ -538,13 +494,8 @@ while : ; do
 	# Purge certain old backups before beginning new backup.
 	# -----------------------------------------------------------------------------
 
-	if [ -n "$PREVIOUS_DEST" ]; then
-		# regardless of expiry strategy keep backup used for --link-dest
-		fn_expire_backups "$PREVIOUS_DEST"
-	else
-		# keep latest backup
-		fn_expire_backups "$DEST"
-	fi
+	# ExFAT one-shot safety: never expire or delete existing snapshots automatically.
+	fn_log_info "Automatic snapshot expiration disabled for this ExFAT run."
 
 	# -----------------------------------------------------------------------------
 	# Start backup
@@ -588,6 +539,9 @@ while : ; do
 
 	if [ -n "$NO_SPACE_LEFT" ]; then
 
+		fn_log_error "No space left on device. ExFAT one-shot mode will NOT delete any existing snapshots."
+		exit 1
+
 		if [[ $AUTO_EXPIRE == "0" ]]; then
 			fn_log_error "No space left on device, and automatic purging of old backups is disabled."
 			exit 1
@@ -627,9 +581,8 @@ while : ; do
 	# Add symlink to last backup
 	# -----------------------------------------------------------------------------
 	if [ "$EXIT_CODE" = 0 ]; then
-		# Create the latest symlink only when rsync succeeded
-		fn_rm_file "$DEST_FOLDER/latest"
-		fn_ln "$(basename -- "$DEST")" "$DEST_FOLDER/latest"
+		# ExFAT has no symlinks. Record the newest successful snapshot in a text file.
+		fn_run_cmd "printf '%s\n' '$(basename -- "$DEST")' > '$DEST_FOLDER/latest.txt'"
 
 		# Remove .inprogress file only when rsync succeeded
 		fn_rm_file "$INPROGRESS_FILE"
