@@ -1,311 +1,668 @@
 #!/usr/bin/env bash
-# rsync_tmbackup_exfat_v2.sh
-# Version 2.0.0
-# Full, timestamped snapshots for ExFAT destinations.
-# No hard links, no --link-dest, no automatic deletion or expiration.
 
-set -u
+APPNAME=$(basename "$0" | sed "s/\.sh$//")
+# ExFAT timestamped snapshot variant: full copies, resumable, no hard links/link-dest.
 
-APP_NAME="$(basename "$0")"
-VERSION="2.0.0"
+# -----------------------------------------------------------------------------
+# Log functions
+# -----------------------------------------------------------------------------
+
+fn_log_info()  { echo "$APPNAME: $1"; }
+fn_log_warn()  { echo "$APPNAME: [WARNING] $1" 1>&2; }
+fn_log_error() { echo "$APPNAME: [ERROR] $1" 1>&2; }
+fn_log_info_cmd()  {
+	if [ -n "$SSH_DEST_FOLDER_PREFIX" ]; then
+		echo "$APPNAME: $SSH_CMD '$1'";
+	else
+		echo "$APPNAME: $1";
+	fi
+}
+
+# -----------------------------------------------------------------------------
+# Make sure everything really stops when CTRL+C is pressed
+# -----------------------------------------------------------------------------
+
+fn_terminate_script() {
+	fn_log_info "SIGINT caught."
+	exit 1
+}
+
+trap 'fn_terminate_script' SIGINT
+
+# -----------------------------------------------------------------------------
+# Small utility functions for reducing code duplication
+# -----------------------------------------------------------------------------
+fn_display_usage() {
+	echo "Usage: $(basename "$0") [OPTION]... <[USER@HOST:]SOURCE> <[USER@HOST:]DESTINATION> [exclude-pattern-file]"
+	echo ""
+	echo "Options"
+	echo " -p, --port             SSH port."
+	echo " -h, --help             Display this help message."
+	echo " -i, --id_rsa           Specify the private ssh key to use."
+	echo " --rsync-get-flags      Display the default rsync flags that are used for backup. If using remote"
+	echo "                        drive over SSH, --compress will be added."
+	echo " --rsync-set-flags      Set the rsync flags that are going to be used for backup."
+	echo " --rsync-append-flags   Append the rsync flags that are going to be used for backup."
+	echo " --log-dir              Set the log file directory. If this flag is set, generated files will"
+	echo "                        not be managed by the script - in particular they will not be"
+	echo "                        automatically deleted."
+	echo "                        Default: $LOG_DIR"
+	echo " --log-to-destination   Set the log file directory to the destination directory. If this flag"
+	echo "                        is set, generated files will not be managed by the script - in particular"
+	echo "                        they will not be automatically deleted."
+	echo " --strategy             Set the expiration strategy. Default: \"1:1 30:7 365:30\" means after one"
+	echo "                        day, keep one backup per day. After 30 days, keep one backup every 7 days."
+	echo "                        After 365 days keep one backup every 30 days."
+	echo " --no-auto-expire       Disable automatically deleting backups when out of space. Instead an error"
+	echo "                        is logged, and the backup is aborted. (ExFAT mode never auto-deletes.)"
+	echo " --exclude-from FILE    Read rsync exclude patterns from FILE. Overrides the default file."
+	echo "                        Default, when present: $DEFAULT_EXCLUDE_FILE"
+	echo ""
+	echo "For more detailed help, please see the README file:"
+	echo ""
+	echo "https://github.com/laurent22/rsync-time-backup/blob/master/README.md"
+}
+
+fn_parse_date() {
+	# Converts YYYY-MM-DD-HHMMSS to YYYY-MM-DD HH:MM:SS and then to Unix Epoch.
+	case "$OSTYPE" in
+		linux*|cygwin*|netbsd*)
+			date -d "${1:0:10} ${1:11:2}:${1:13:2}:${1:15:2}" +%s ;;
+		FreeBSD*) date -j -f "%Y-%m-%d-%H%M%S" "$1" "+%s" ;;
+		darwin*)
+			# Under MacOS X Tiger
+			# Or with GNU 'coreutils' installed (by homebrew)
+			#   'date -j' doesn't work, so we do this:
+			yy=$(expr ${1:0:4})
+			mm=$(expr ${1:5:2} - 1)
+			dd=$(expr ${1:8:2})
+			hh=$(expr ${1:11:2})
+			mi=$(expr ${1:13:2})
+			ss=$(expr ${1:15:2})
+			perl -e 'use Time::Local; print timelocal('$ss','$mi','$hh','$dd','$mm','$yy'),"\n";' ;;
+	esac
+}
+
+fn_find_backups() {
+	fn_run_cmd "find "$DEST_FOLDER/" -maxdepth 1 -type d -name \"????-??-??-??????\" -prune | sort -r"
+}
+
+fn_expire_backup() {
+	# Double-check that we're on a backup destination to be completely
+	# sure we're deleting the right folder
+	if [ -z "$(fn_find_backup_marker "$(dirname -- "$1")")" ]; then
+		fn_log_error "$1 is not on a backup destination - aborting."
+		exit 1
+	fi
+
+	fn_log_info "Expiring $1"
+	fn_rm_dir "$1"
+}
+
+fn_expire_backups() {
+	local current_timestamp=$EPOCH
+	local last_kept_timestamp=9999999999
+
+	# we will keep requested backup
+	backup_to_keep="$1"
+	# we will also keep the oldest backup
+	oldest_backup_to_keep="$(fn_find_backups | sort | sed -n '1p')"
+
+	# Process each backup dir from the oldest to the most recent
+	for backup_dir in $(fn_find_backups | sort); do
+
+		local backup_date=$(basename "$backup_dir")
+		local backup_timestamp=$(fn_parse_date "$backup_date")
+
+		# Skip if failed to parse date...
+		if [ -z "$backup_timestamp" ]; then
+			fn_log_warn "Could not parse date: $backup_dir"
+			continue
+		fi
+
+		if [ "$backup_dir" == "$backup_to_keep" ]; then
+			# this is the latest backup requsted to be kept. We can finish pruning
+			break
+		fi
+
+		if [ "$backup_dir" == "$oldest_backup_to_keep" ]; then
+			# We dont't want to delete the oldest backup. It becomes first "last kept" backup
+			last_kept_timestamp=$backup_timestamp
+			# As we keep it we can skip processing it and go to the next oldest one in the loop
+			continue
+		fi
+
+		# Find which strategy token applies to this particular backup
+		for strategy_token in $(echo $EXPIRATION_STRATEGY | tr " " "\n" | sort -r -n); do
+			IFS=':' read -r -a t <<< "$strategy_token"
+
+			# After which date (relative to today) this token applies (X) - we use seconds to get exact cut off time
+			local cut_off_timestamp=$((current_timestamp - ${t[0]} * 86400))
+
+			# Every how many days should a backup be kept past the cut off date (Y) - we use days (not seconds)
+			local cut_off_interval_days=$((${t[1]}))
+
+			# If we've found the strategy token that applies to this backup
+			if [ "$backup_timestamp" -le "$cut_off_timestamp" ]; then
+
+				# Special case: if Y is "0" we delete every time
+				if [ $cut_off_interval_days -eq "0" ]; then
+					fn_expire_backup "$backup_dir"
+					break
+				fi
+
+				# we calculate days number since last kept backup
+				local last_kept_timestamp_days=$((last_kept_timestamp / 86400))
+				local backup_timestamp_days=$((backup_timestamp / 86400))
+				local interval_since_last_kept_days=$((backup_timestamp_days - last_kept_timestamp_days))
+
+				# Check if the current backup is in the interval between
+				# the last backup that was kept and Y
+				# to determine what to keep/delete we use days difference
+				if [ "$interval_since_last_kept_days" -lt "$cut_off_interval_days" ]; then
+
+					# Yes: Delete that one
+					fn_expire_backup "$backup_dir"
+					# backup deleted no point to check shorter timespan strategies - go to the next backup
+					break
+
+				else
+
+					# No: Keep it.
+					# this is now the last kept backup
+					last_kept_timestamp=$backup_timestamp
+					# and go to the next backup
+					break
+				fi
+			fi
+		done
+	done
+}
+
+fn_parse_ssh() {
+	# To keep compatibility with bash version < 3, we use grep
+	if echo "$DEST_FOLDER"|grep -Eq '^[A-Za-z0-9\._%\+\-]+@[A-Za-z0-9.\-]+\:.+$'
+	then
+		SSH_USER=$(echo "$DEST_FOLDER" | sed -E  's/^([A-Za-z0-9\._%\+\-]+)@([A-Za-z0-9.\-]+)\:(.+)$/\1/')
+		SSH_HOST=$(echo "$DEST_FOLDER" | sed -E  's/^([A-Za-z0-9\._%\+\-]+)@([A-Za-z0-9.\-]+)\:(.+)$/\2/')
+		SSH_DEST_FOLDER=$(echo "$DEST_FOLDER" | sed -E  's/^([A-Za-z0-9\._%\+\-]+)@([A-Za-z0-9.\-]+)\:(.+)$/\3/')
+		if [ -n "$ID_RSA" ] ; then
+			SSH_CMD="ssh -p $SSH_PORT -i $ID_RSA ${SSH_USER}@${SSH_HOST}"
+		else
+			SSH_CMD="ssh -p $SSH_PORT ${SSH_USER}@${SSH_HOST}"
+		fi
+		SSH_DEST_FOLDER_PREFIX="${SSH_USER}@${SSH_HOST}:"
+	elif echo "$SRC_FOLDER"|grep -Eq '^[A-Za-z0-9\._%\+\-]+@[A-Za-z0-9.\-]+\:.+$'
+	then
+		SSH_USER=$(echo "$SRC_FOLDER" | sed -E  's/^([A-Za-z0-9\._%\+\-]+)@([A-Za-z0-9.\-]+)\:(.+)$/\1/')
+		SSH_HOST=$(echo "$SRC_FOLDER" | sed -E  's/^([A-Za-z0-9\._%\+\-]+)@([A-Za-z0-9.\-]+)\:(.+)$/\2/')
+		SSH_SRC_FOLDER=$(echo "$SRC_FOLDER" | sed -E  's/^([A-Za-z0-9\._%\+\-]+)@([A-Za-z0-9.\-]+)\:(.+)$/\3/')
+		if [ -n "$ID_RSA" ] ; then
+			SSH_CMD="ssh -p $SSH_PORT -i $ID_RSA ${SSH_USER}@${SSH_HOST}"
+		else
+			SSH_CMD="ssh -p $SSH_PORT ${SSH_USER}@${SSH_HOST}"
+		fi
+		SSH_SRC_FOLDER_PREFIX="${SSH_USER}@${SSH_HOST}:"
+	fi
+}
+
+fn_run_cmd() {
+	if [ -n "$SSH_DEST_FOLDER_PREFIX" ]
+	then
+		eval "$SSH_CMD '$1'"
+	else
+		eval $1
+	fi
+}
+
+fn_run_cmd_src() {
+	if [ -n "$SSH_SRC_FOLDER_PREFIX" ]
+	then
+		eval "$SSH_CMD '$1'"
+	else
+		eval $1
+	fi
+}
+
+fn_find() {
+	fn_run_cmd "find '$1'"  2>/dev/null
+}
+
+fn_get_absolute_path() {
+	fn_run_cmd "cd '$1';pwd"
+}
+
+fn_mkdir() {
+	fn_run_cmd "mkdir -p -- '$1'"
+}
+
+# Removes a file or symlink - not for directories
+fn_rm_file() {
+	fn_run_cmd "rm -f -- '$1'"
+}
+
+fn_rm_dir() {
+	fn_run_cmd "rm -rf -- '$1'"
+}
+
+fn_touch() {
+	fn_run_cmd "touch -- '$1'"
+}
+
+fn_ln() {
+	fn_run_cmd "ln -s -- '$1' '$2'"
+}
+
+fn_test_file_exists_src() {
+	fn_run_cmd_src "test -e '$1'"
+}
+
+fn_df_t_src() {
+	fn_run_cmd_src "df -T '${1}'"
+}
+
+fn_df_t() {
+	fn_run_cmd "df -T '${1}'"
+}
+
+fn_state_exists() { fn_run_cmd "test -f '$1'"; }
+fn_state_read() { fn_run_cmd "cat '$1'"; }
+fn_state_write() {
+	local value="$1"
+	local path="$2"
+	if [ -n "$SSH_DEST_FOLDER_PREFIX" ]; then
+		printf '%s\n' "$value" | eval "$SSH_CMD "cat > '$path'""
+	else
+		printf '%s\n' "$value" > "$path"
+	fi
+}
+fn_dest_dir_exists() { fn_run_cmd "test -d '$1'"; }
+
+# -----------------------------------------------------------------------------
+# Source and destination information
+# -----------------------------------------------------------------------------
+SSH_USER=""
+SSH_HOST=""
+SSH_DEST_FOLDER=""
+SSH_SRC_FOLDER=""
+SSH_CMD=""
+SSH_DEST_FOLDER_PREFIX=""
+SSH_SRC_FOLDER_PREFIX=""
+SSH_PORT="22"
+ID_RSA=""
+
+SRC_FOLDER=""
+DEST_FOLDER=""
+EXCLUSION_FILE=""
+LOG_DIR="$HOME/.$APPNAME"
+AUTO_DELETE_LOG="1"
+LOG_TO_DEST="0"
+EXPIRATION_STRATEGY="1:1 30:7 365:30"
+AUTO_EXPIRE="1"
+
+# ExFAT cannot represent Unix hard links, symlinks, owners, groups, permissions, or devices.
+# --copy-links stores the contents referenced by symlinks as normal files/directories.
+RSYNC_FLAGS="--copy-links --one-file-system --itemize-changes --times --recursive --stats --human-readable --modify-window=2 --partial --partial-dir=.rsync-partial"
 DEFAULT_EXCLUDE_FILE="$HOME/.config/rsync_tmbackup/excludes.txt"
-MARKER_NAME="backup.marker"
-INPROGRESS_NAME="backup.inprogress"
-LATEST_NAME="latest.txt"
-LOG_DIR_NAME="logs"
-PARTIAL_DIR_NAME=".rsync-partial"
-DRY_RUN=0
-EXCLUDE_FILE=""
-NO_DEFAULT_EXCLUDES=0
-SOURCE=""
-DEST_ROOT=""
-CURRENT_SNAPSHOT=""
-LOG_FILE=""
+EXCLUDE_FROM_FILE=""
 
-info()  { printf '%s: %s\n' "$APP_NAME" "$*"; }
-warn()  { printf '%s: [WARNING] %s\n' "$APP_NAME" "$*" >&2; }
-error() { printf '%s: [ERROR] %s\n' "$APP_NAME" "$*" >&2; }
-die()   { error "$*"; exit 1; }
+while :; do
+	case $1 in
+		-h|-\?|--help)
+			fn_display_usage
+			exit
+			;;
+		-p|--port)
+			shift
+			SSH_PORT=$1
+			;;
+		-i|--id_rsa)
+			shift
+			ID_RSA="$1"
+			;;
+		--rsync-get-flags)
+			shift
+			echo "$RSYNC_FLAGS"
+			exit
+			;;
+		--rsync-set-flags)
+			shift
+			RSYNC_FLAGS="$1"
+			;;
+		--rsync-append-flags)
+			shift
+			RSYNC_FLAGS="$RSYNC_FLAGS $1"
+			;;
+		--exclude-from)
+			shift
+			if [ -z "$1" ]; then
+				fn_log_error "--exclude-from requires a file path."
+				exit 1
+			fi
+			EXCLUDE_FROM_FILE="$1"
+			;;
+		--strategy)
+			shift
+			EXPIRATION_STRATEGY="$1"
+			;;
+		--log-dir)
+			shift
+			LOG_DIR="$1"
+			AUTO_DELETE_LOG="0"
+			;;
+		--log-to-destination)
+			LOG_TO_DEST="1"
+			AUTO_DELETE_LOG="0"
+			;;
+		--no-auto-expire)
+			AUTO_EXPIRE="0"
+			;;
+		--)
+			shift
+			SRC_FOLDER="$1"
+			DEST_FOLDER="$2"
+			EXCLUSION_FILE="$3"
+			break
+			;;
+		-*)
+			fn_log_error "Unknown option: \"$1\""
+			fn_log_info ""
+			fn_display_usage
+			exit 1
+			;;
+		*)
+			SRC_FOLDER="$1"
+			DEST_FOLDER="$2"
+			EXCLUSION_FILE="$3"
+			break
+	esac
 
-usage() {
-  cat <<USAGE
-$APP_NAME v$VERSION
-
-Usage:
-  $APP_NAME [options] SOURCE DESTINATION [LEGACY_EXCLUDE_FILE]
-
-Creates a complete timestamped snapshot under DESTINATION. If an interrupted
-backup is detected, it resumes the snapshot named by DESTINATION/$LATEST_NAME.
-
-Options:
-  --exclude-from FILE   Override the default exclude file.
-  --no-default-excludes Do not automatically load $DEFAULT_EXCLUDE_FILE.
-  --dry-run             Show what rsync would do without changing backup data.
-  -h, --help            Show this help.
-  --version             Show version.
-
-Destination safety marker:
-  DESTINATION/$MARKER_NAME must exist before a real run.
-
-Example:
-  touch "/Volumes/Sandisk1TB/Backups/$MARKER_NAME"
-  $APP_NAME --exclude-from "$HOME/backup-excludes.txt" \
-    "$HOME" "/Volumes/Sandisk1TB/Backups"
-USAGE
-}
-
-trim_state_value() {
-  # Remove CR/LF and surrounding whitespace. Repair the known legacy trailing
-  # literal 'n' only when it follows an otherwise valid timestamp.
-  local value="$1"
-  value="$(printf '%s' "$value" | tr -d '\r\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
-  case "$value" in
-    ????-??-??-??????n) value="${value%n}" ;;
-  esac
-  printf '%s' "$value"
-}
-
-valid_snapshot_name() {
-  printf '%s' "$1" | grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{6}$'
-}
-
-atomic_write() {
-  local destination="$1"
-  local value="$2"
-  local temporary="${destination}.tmp.$$"
-  printf '%s\n' "$value" > "$temporary" || return 1
-  mv -f "$temporary" "$destination"
-}
-
-human_kib() {
-  awk -v kib="$1" 'BEGIN {
-    split("KiB MiB GiB TiB PiB", u, " ");
-    n=kib; i=1;
-    while (n>=1024 && i<5) { n/=1024; i++ }
-    if (i==1) printf "%.0f %s", n, u[i]; else printf "%.1f %s", n, u[i]
-  }'
-}
-
-count_exclude_patterns() {
-  awk 'BEGIN { n=0 }
-    { sub(/\r$/, "") }
-    /^[[:space:]]*$/ { next }
-    /^[[:space:]]*#/ { next }
-    { n++ }
-    END { print n }' "$1"
-}
-
-on_interrupt() {
-  printf '\n' >&2
-  warn "Interrupted. Resume state was retained. Run the same command again."
-  [ -n "$CURRENT_SNAPSHOT" ] && warn "Incomplete snapshot: $CURRENT_SNAPSHOT"
-  exit 130
-}
-trap on_interrupt INT TERM HUP
-
-# Parse options without eval.
-while [ "$#" -gt 0 ]; do
-  case "$1" in
-    --exclude-from)
-      [ "$#" -ge 2 ] || die "--exclude-from requires a file path."
-      EXCLUDE_FILE="$2"
-      shift 2
-      ;;
-    --exclude-from=*)
-      EXCLUDE_FILE="${1#*=}"
-      shift
-      ;;
-    --no-default-excludes)
-      NO_DEFAULT_EXCLUDES=1
-      shift
-      ;;
-    --dry-run)
-      DRY_RUN=1
-      shift
-      ;;
-    --version)
-      printf '%s v%s\n' "$APP_NAME" "$VERSION"
-      exit 0
-      ;;
-    -h|--help)
-      usage
-      exit 0
-      ;;
-    --)
-      shift
-      break
-      ;;
-    -*)
-      die "Unknown option: $1"
-      ;;
-    *)
-      break
-      ;;
-  esac
+	shift
 done
 
-[ "$#" -ge 2 ] && [ "$#" -le 3 ] || { usage >&2; exit 2; }
-SOURCE="$1"
-DEST_ROOT="$2"
-LEGACY_EXCLUDE_FILE="${3:-}"
-
-# A third positional argument remains supported for compatibility.
-if [ -n "$LEGACY_EXCLUDE_FILE" ]; then
-  [ -z "$EXCLUDE_FILE" ] || die "Specify an exclude file either with --exclude-from or as the third argument, not both."
-  EXCLUDE_FILE="$LEGACY_EXCLUDE_FILE"
-elif [ -z "$EXCLUDE_FILE" ] && [ "$NO_DEFAULT_EXCLUDES" -eq 0 ] && [ -f "$DEFAULT_EXCLUDE_FILE" ]; then
-  EXCLUDE_FILE="$DEFAULT_EXCLUDE_FILE"
+# Resolve exclude file precedence: explicit --exclude-from, legacy third argument, then default.
+if [ -z "$EXCLUDE_FROM_FILE" ] && [ -n "$EXCLUSION_FILE" ]; then
+	EXCLUDE_FROM_FILE="$EXCLUSION_FILE"
 fi
-
-command -v rsync >/dev/null 2>&1 || die "rsync is not installed or not in PATH."
-[ -e "$SOURCE" ] || die "Source does not exist: $SOURCE"
-[ -d "$SOURCE" ] || die "Source must be a directory: $SOURCE"
-[ -d "$DEST_ROOT" ] || die "Destination directory does not exist: $DEST_ROOT"
-[ -w "$DEST_ROOT" ] || die "Destination is not writable: $DEST_ROOT"
-
-# Resolve local paths so state and safety checks are unambiguous.
-SOURCE="$(cd "$SOURCE" 2>/dev/null && pwd -P)" || die "Cannot resolve source path."
-DEST_ROOT="$(cd "$DEST_ROOT" 2>/dev/null && pwd -P)" || die "Cannot resolve destination path."
-
-case "$DEST_ROOT/" in
-  "$SOURCE/"*|"$SOURCE/") die "Destination cannot be inside the source." ;;
-esac
-case "$SOURCE/" in
-  "$DEST_ROOT/"*|"$DEST_ROOT/") warn "Source is inside the destination; verify this is intentional." ;;
-esac
-
-MARKER_FILE="$DEST_ROOT/$MARKER_NAME"
-INPROGRESS_FILE="$DEST_ROOT/$INPROGRESS_NAME"
-LATEST_FILE="$DEST_ROOT/$LATEST_NAME"
-LOG_DIR="$DEST_ROOT/$LOG_DIR_NAME"
-
-if [ "$DRY_RUN" -eq 0 ]; then
-  [ -f "$MARKER_FILE" ] || die "Safety marker missing: $MARKER_FILE\nCreate it only after confirming this is the correct destination:\n  touch \"$MARKER_FILE\""
+if [ -z "$EXCLUDE_FROM_FILE" ] && [ -f "$DEFAULT_EXCLUDE_FILE" ]; then
+	EXCLUDE_FROM_FILE="$DEFAULT_EXCLUDE_FILE"
 fi
-
-if [ -n "$EXCLUDE_FILE" ]; then
-  [ -f "$EXCLUDE_FILE" ] || die "Exclude file not found: $EXCLUDE_FILE"
-  [ -r "$EXCLUDE_FILE" ] || die "Exclude file is not readable: $EXCLUDE_FILE"
-  EXCLUDE_FILE="$(cd "$(dirname "$EXCLUDE_FILE")" && printf '%s/%s\n' "$(pwd -P)" "$(basename "$EXCLUDE_FILE")")"
-  EXCLUDE_COUNT="$(count_exclude_patterns "$EXCLUDE_FILE")"
+if [ -n "$EXCLUDE_FROM_FILE" ]; then
+	if [ ! -f "$EXCLUDE_FROM_FILE" ] || [ ! -r "$EXCLUDE_FROM_FILE" ]; then
+		fn_log_error "Exclude file '$EXCLUDE_FROM_FILE' does not exist or is not readable."
+		exit 1
+	fi
+	EXCLUDE_PATTERN_COUNT=$(awk 'BEGIN{n=0} /^[[:space:]]*($|#)/{next} {n++} END{print n}' "$EXCLUDE_FROM_FILE")
+	fn_log_info "Exclude file: $EXCLUDE_FROM_FILE"
+	fn_log_info "Active exclude patterns: $EXCLUDE_PATTERN_COUNT"
 else
-  EXCLUDE_COUNT=0
+	fn_log_info "Exclude file: none"
+	fn_log_info "Active exclude patterns: 0"
+	fn_log_warn "No files or folders will be excluded."
 fi
 
-RESUMING=0
-SNAPSHOT_NAME=""
-if [ -f "$INPROGRESS_FILE" ]; then
-  [ -f "$LATEST_FILE" ] || die "$INPROGRESS_NAME exists, but $LATEST_NAME is missing. Refusing to guess the interrupted snapshot."
-  RAW_LATEST="$(cat "$LATEST_FILE" 2>/dev/null || true)"
-  SNAPSHOT_NAME="$(trim_state_value "$RAW_LATEST")"
-  valid_snapshot_name "$SNAPSHOT_NAME" || die "Invalid snapshot name in $LATEST_FILE: '$RAW_LATEST'"
-  SNAPSHOT_DIR="$DEST_ROOT/$SNAPSHOT_NAME"
-  [ -d "$SNAPSHOT_DIR" ] || die "Resume snapshot directory does not exist: $SNAPSHOT_DIR"
-  RESUMING=1
+# Display usage information if required arguments are not passed
+if [[ -z "$SRC_FOLDER" || -z "$DEST_FOLDER" ]]; then
+	fn_display_usage
+	exit 1
+fi
+
+# Strips off last slash from dest. Note that it means the root folder "/"
+# will be represented as an empty string "", which is fine
+# with the current script (since a "/" is added when needed)
+# but still something to keep in mind.
+# However, due to this behavior we delay stripping the last slash for
+# the source folder until after parsing for ssh usage.
+
+DEST_FOLDER="${DEST_FOLDER%/}"
+
+fn_parse_ssh
+
+if [ -n "$SSH_DEST_FOLDER" ]; then
+	DEST_FOLDER="$SSH_DEST_FOLDER"
+fi
+
+if [ -n "$SSH_SRC_FOLDER" ]; then
+	SRC_FOLDER="$SSH_SRC_FOLDER"
+fi
+
+# Exit if source folder does not exist.
+if ! fn_test_file_exists_src "${SRC_FOLDER}"; then
+	fn_log_error "Source folder \"${SRC_FOLDER}\" does not exist - aborting."
+	exit 1
+fi
+
+# Now strip off last slash from source folder.
+SRC_FOLDER="${SRC_FOLDER%/}"
+
+for ARG in "$SRC_FOLDER" "$DEST_FOLDER" "$EXCLUDE_FROM_FILE"; do
+	if [[ "$ARG" == *"'"* ]]; then
+		fn_log_error 'Source and destination directories may not contain single quote characters.'
+		exit 1
+	fi
+done
+
+# -----------------------------------------------------------------------------
+# Check that the destination drive is a backup drive
+# -----------------------------------------------------------------------------
+
+# ExFAT variant: hard links are intentionally not used.
+
+fn_backup_marker_path() { echo "$1/backup.marker"; }
+fn_find_backup_marker() { fn_find "$(fn_backup_marker_path "$1")" 2>/dev/null; }
+
+if [ -z "$(fn_find_backup_marker "$DEST_FOLDER")" ]; then
+	fn_log_info "Safety check failed - the destination does not appear to be a backup folder or drive (marker file not found)."
+	fn_log_info "If it is indeed a backup folder, you may add the marker file by running the following command:"
+	fn_log_info ""
+	fn_log_info_cmd "mkdir -p -- \"$DEST_FOLDER\" ; touch \"$(fn_backup_marker_path "$DEST_FOLDER")\""
+	fn_log_info ""
+	exit 1
+fi
+
+# Check source and destination file-system (df -T /dest).
+# If one of them is FAT, use the --modify-window rsync parameter
+# (see man rsync) with a value of 1 or 2.
+#
+# The check is performed by taking the second row
+# of the output of the first command.
+if [[ "$(fn_df_t_src "${SRC_FOLDER}" | awk '{print $2}' | grep -c -i -e "fat")" -gt 0 ]]; then
+	fn_log_info "Source file-system is a version of FAT."
+	fn_log_info "Using the --modify-window rsync parameter with value 2."
+	RSYNC_FLAGS="${RSYNC_FLAGS} --modify-window=2"
+elif [[ "$(fn_df_t "${DEST_FOLDER}" | awk '{print $2}' | grep -c -i -e "fat")" -gt 0 ]]; then
+	fn_log_info "Destination file-system is a version of FAT."
+	fn_log_info "Using the --modify-window rsync parameter with value 2."
+	RSYNC_FLAGS="${RSYNC_FLAGS} --modify-window=2"
+fi
+
+# -----------------------------------------------------------------------------
+# Setup additional variables
+# -----------------------------------------------------------------------------
+
+fn_log_info "Version: 2.1 ExFAT compatible"
+fn_log_info "Hard links/link-dest: disabled"
+fn_log_info "Expiration: disabled; existing snapshots will not be deleted"
+
+# Date logic
+NOW=$(date +"%Y-%m-%d-%H%M%S")
+EPOCH=$(date "+%s")
+KEEP_ALL_DATE=$((EPOCH - 86400))       # 1 day ago
+KEEP_DAILIES_DATE=$((EPOCH - 2678400)) # 31 days ago
+
+export IFS=$'\n' # Better for handling spaces in filenames.
+PREVIOUS_DEST=""  # ExFAT variant always creates a full independent snapshot
+INPROGRESS_FILE="$DEST_FOLDER/backup.inprogress"
+LATEST_FILE="$DEST_FOLDER/latest.txt"
+MYPID="$$"
+DEST=""
+
+# Resume an interrupted ExFAT snapshot when both marker files are present.
+if fn_state_exists "$INPROGRESS_FILE" && fn_state_exists "$LATEST_FILE"; then
+	RESUME_NAME=$(fn_state_read "$LATEST_FILE" | tr -d '\r\n')
+
+	# Repair files produced by an older quoting bug: timestamp followed by literal "n".
+	case "$RESUME_NAME" in
+		????-??-??-??????n) RESUME_NAME=${RESUME_NAME%n} ;;
+	esac
+
+	case "$RESUME_NAME" in
+		????-??-??-??????) ;;
+		*)
+			fn_log_error "Cannot resume: '$LATEST_FILE' does not contain a valid timestamped snapshot name."
+			exit 1
+			;;
+	esac
+
+	if fn_dest_dir_exists "$DEST_FOLDER/$RESUME_NAME"; then
+		DEST="$DEST_FOLDER/$RESUME_NAME"
+		fn_log_warn "Resuming interrupted snapshot: $SSH_DEST_FOLDER_PREFIX$DEST"
+		# Rewrite latest.txt cleanly, removing any legacy trailing literal n.
+		fn_state_write "$RESUME_NAME" "$LATEST_FILE"
+	else
+		fn_log_error "Cannot resume: snapshot directory '$DEST_FOLDER/$RESUME_NAME' does not exist."
+		exit 1
+	fi
 else
-  SNAPSHOT_NAME="$(date '+%Y-%m-%d-%H%M%S')"
-  SNAPSHOT_DIR="$DEST_ROOT/$SNAPSHOT_NAME"
-  [ ! -e "$SNAPSHOT_DIR" ] || die "Snapshot path already exists: $SNAPSHOT_DIR"
-fi
-CURRENT_SNAPSHOT="$SNAPSHOT_DIR"
-
-AVAILABLE_KIB="$(df -Pk "$DEST_ROOT" | awk 'NR==2 {print $4}')"
-SOURCE_KIB="$(du -sk "$SOURCE" 2>/dev/null | awk '{print $1}')"
-[ -n "$AVAILABLE_KIB" ] || AVAILABLE_KIB=0
-[ -n "$SOURCE_KIB" ] || SOURCE_KIB=0
-
-printf '\n%s v%s\n' "$APP_NAME" "$VERSION"
-printf '%s\n' '------------------------------------------------------------'
-printf 'Mode:                 ExFAT full timestamped snapshot\n'
-printf 'Source:               %s\n' "$SOURCE"
-printf 'Destination root:     %s\n' "$DEST_ROOT"
-printf 'Snapshot:             %s\n' "$SNAPSHOT_NAME"
-printf 'Resume:               %s\n' "$([ "$RESUMING" -eq 1 ] && printf 'Yes' || printf 'No')"
-printf 'Dry run:              %s\n' "$([ "$DRY_RUN" -eq 1 ] && printf 'Yes' || printf 'No')"
-if [ -n "$EXCLUDE_FILE" ]; then
-  printf 'Exclude file:          %s\n' "$EXCLUDE_FILE"
-else
-  printf 'Exclude file:          none\n'
-fi
-printf 'Active exclude rules:  %s\n' "$EXCLUDE_COUNT"
-printf 'Source apparent size:  %s\n' "$(human_kib "$SOURCE_KIB")"
-printf 'Destination free:     %s\n' "$(human_kib "$AVAILABLE_KIB")"
-printf '%s\n\n' '------------------------------------------------------------'
-
-if [ -z "$EXCLUDE_FILE" ]; then
-  warn "No exclude file is active; no files or folders will be excluded."
-elif [ "$EXCLUDE_COUNT" -eq 0 ]; then
-  warn "The exclude file contains no active patterns."
+	DEST="$DEST_FOLDER/$NOW"
 fi
 
-if [ "$RESUMING" -eq 0 ] && [ "$SOURCE_KIB" -gt "$AVAILABLE_KIB" ]; then
-  warn "The source appears larger than the currently available destination space."
-  warn "Because this is a full snapshot without hard links, the backup may run out of space."
+# -----------------------------------------------------------------------------
+# Create log folder if it doesn't exist
+# -----------------------------------------------------------------------------
+
+if [[ $LOG_TO_DEST == "1" ]]; then
+	LOG_DIR="$DEST_FOLDER/.$APPNAME"
 fi
 
-mkdir -p "$LOG_DIR" || die "Could not create log directory: $LOG_DIR"
-LOG_FILE="$LOG_DIR/$SNAPSHOT_NAME.log"
-
-RSYNC_ARGS=(
-  --recursive
-  --times
-  --copy-links
-  --one-file-system
-  --itemize-changes
-  --stats
-  --human-readable
-  --modify-window=2
-  --partial
-  "--partial-dir=$PARTIAL_DIR_NAME"
-)
-
-if [ -n "$EXCLUDE_FILE" ]; then
-  RSYNC_ARGS+=("--exclude-from=$EXCLUDE_FILE")
-fi
-if [ "$DRY_RUN" -eq 1 ]; then
-  RSYNC_ARGS+=(--dry-run)
+if [ ! -d "$LOG_DIR" ]; then
+	fn_log_info "Creating log folder in '$LOG_DIR'..."
+	mkdir -p -- "$LOG_DIR"
 fi
 
-# Use trailing slashes to copy SOURCE contents into the timestamped directory.
-if [ "$DRY_RUN" -eq 0 ]; then
-  if [ "$RESUMING" -eq 0 ]; then
-    mkdir -p "$SNAPSHOT_DIR" || die "Could not create snapshot directory: $SNAPSHOT_DIR"
-    atomic_write "$LATEST_FILE" "$SNAPSHOT_NAME" || die "Could not write $LATEST_FILE"
-    atomic_write "$INPROGRESS_FILE" "$SNAPSHOT_NAME" || die "Could not write $INPROGRESS_FILE"
-  else
-    # Normalize legacy/malformed latest.txt contents before resuming.
-    atomic_write "$LATEST_FILE" "$SNAPSHOT_NAME" || die "Could not normalize $LATEST_FILE"
-    atomic_write "$INPROGRESS_FILE" "$SNAPSHOT_NAME" || die "Could not normalize $INPROGRESS_FILE"
-    info "Resuming interrupted snapshot: $SNAPSHOT_DIR"
-  fi
-else
-  info "Dry run: state files and snapshot directories will not be changed."
-fi
+# -----------------------------------------------------------------------------
+# ExFAT resumable behavior
+# -----------------------------------------------------------------------------
+# Existing completed snapshots are never modified. If backup.inprogress exists,
+# the validated snapshot named by latest.txt is resumed in place.
 
-info "Starting rsync. Log: $LOG_FILE"
-set +e
-rsync "${RSYNC_ARGS[@]}" "$SOURCE/" "$SNAPSHOT_DIR/" 2>&1 | tee -a "$LOG_FILE"
-RSYNC_STATUS=${PIPESTATUS[0]}
-set -e
+# Run in a loop to handle the "No space left on device" logic.
+while : ; do
 
-if [ "$RSYNC_STATUS" -ne 0 ]; then
-  error "rsync exited with status $RSYNC_STATUS."
-  if [ "$DRY_RUN" -eq 0 ]; then
-    warn "Resume state retained. Run the same command again to continue snapshot $SNAPSHOT_NAME."
-  fi
-  exit "$RSYNC_STATUS"
-fi
+	# -----------------------------------------------------------------------------
+	# Check if we are doing an incremental backup (if previous backup exists).
+	# -----------------------------------------------------------------------------
 
-if [ "$DRY_RUN" -eq 1 ]; then
-  info "Dry run completed successfully."
-  exit 0
-fi
+	LINK_DEST_OPTION=""
+	fn_log_info "Creating a full independent ExFAT snapshot (hard links/link-dest disabled)."
 
-rm -f "$INPROGRESS_FILE" || die "Backup copied successfully, but could not remove $INPROGRESS_FILE"
-atomic_write "$LATEST_FILE" "$SNAPSHOT_NAME" || die "Backup copied successfully, but could not finalize $LATEST_FILE"
+	# -----------------------------------------------------------------------------
+	# Create destination folder if it doesn't already exists
+	# -----------------------------------------------------------------------------
 
-# Remove an empty partial directory, but preserve it if partial files remain.
-rmdir "$SNAPSHOT_DIR/$PARTIAL_DIR_NAME" 2>/dev/null || true
+	if [ -z "$(fn_find "$DEST -type d" 2>/dev/null)" ]; then
+		fn_log_info "Creating destination $SSH_DEST_FOLDER_PREFIX$DEST"
+		fn_mkdir "$DEST"
+	fi
 
-info "Snapshot completed successfully: $SNAPSHOT_DIR"
-info "Resume marker removed; $LATEST_NAME now identifies the completed snapshot."
+	# -----------------------------------------------------------------------------
+	# Purge certain old backups before beginning new backup.
+	# -----------------------------------------------------------------------------
+
+	# ExFAT one-shot safety: never expire or delete existing snapshots automatically.
+	fn_log_info "Automatic snapshot expiration disabled for this ExFAT run."
+
+	# -----------------------------------------------------------------------------
+	# Start backup
+	# -----------------------------------------------------------------------------
+
+	LOG_FILE="$LOG_DIR/$(date +"%Y-%m-%d-%H%M%S").log"
+
+	fn_log_info "Starting backup..."
+	fn_log_info "From: $SSH_SRC_FOLDER_PREFIX$SRC_FOLDER/"
+	fn_log_info "To:   $SSH_DEST_FOLDER_PREFIX$DEST/"
+
+	CMD="rsync"
+	if [ -n "$SSH_CMD" ]; then
+		RSYNC_FLAGS="$RSYNC_FLAGS --compress"
+		if [ -n "$ID_RSA" ] ; then
+			CMD="$CMD  -e 'ssh -p $SSH_PORT -i $ID_RSA -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null'"
+		else
+			CMD="$CMD  -e 'ssh -p $SSH_PORT -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null'"
+		fi
+	fi
+	CMD="$CMD $RSYNC_FLAGS"
+	CMD="$CMD --log-file '$LOG_FILE'"
+	if [ -n "$EXCLUDE_FROM_FILE" ]; then
+		CMD="$CMD --exclude-from '$EXCLUDE_FROM_FILE'"
+	fi
+	CMD="$CMD $LINK_DEST_OPTION"
+	CMD="$CMD -- '$SSH_SRC_FOLDER_PREFIX$SRC_FOLDER/' '$SSH_DEST_FOLDER_PREFIX$DEST/'"
+
+	fn_log_info "Running command:"
+	fn_log_info "$CMD"
+
+	# Record the active snapshot before rsync starts so a disconnected run can resume.
+	fn_state_write "$(basename -- "$DEST")" "$LATEST_FILE"
+	fn_state_write "$MYPID" "$INPROGRESS_FILE"
+	eval $CMD
+
+	# -----------------------------------------------------------------------------
+	# Check if we ran out of space
+	# -----------------------------------------------------------------------------
+
+	NO_SPACE_LEFT="$(grep "No space left on device (28)\|Result too large (34)" "$LOG_FILE")"
+
+	if [ -n "$NO_SPACE_LEFT" ]; then
+
+		fn_log_error "No space left on device. ExFAT one-shot mode will NOT delete any existing snapshots."
+		exit 1
+
+		if [[ $AUTO_EXPIRE == "0" ]]; then
+			fn_log_error "No space left on device, and automatic purging of old backups is disabled."
+			exit 1
+		fi
+
+		fn_log_warn "No space left on device - removing oldest backup and resuming."
+
+		if [[ "$(fn_find_backups | wc -l)" -lt "2" ]]; then
+			fn_log_error "No space left on device, and no old backup to delete."
+			exit 1
+		fi
+
+		fn_expire_backup "$(fn_find_backups | tail -n 1)"
+
+		# Resume backup
+		continue
+	fi
+
+	# -----------------------------------------------------------------------------
+	# Check whether rsync reported any errors
+	# -----------------------------------------------------------------------------
+
+	EXIT_CODE="1"
+	if [ -n "$(grep "rsync error:" "$LOG_FILE")" ]; then
+		fn_log_error "Rsync reported an error. Run this command for more details: grep -E 'rsync:|rsync error:' '$LOG_FILE'"
+	elif [ -n "$(grep "rsync:" "$LOG_FILE")" ]; then
+		fn_log_warn "Rsync reported a warning. Run this command for more details: grep -E 'rsync:|rsync error:' '$LOG_FILE'"
+	else
+		fn_log_info "Backup completed without errors."
+		if [[ $AUTO_DELETE_LOG == "1" ]]; then
+			rm -f -- "$LOG_FILE"
+		fi
+		EXIT_CODE="0"
+	fi
+
+	# -----------------------------------------------------------------------------
+	# Add symlink to last backup
+	# -----------------------------------------------------------------------------
+	if [ "$EXIT_CODE" = 0 ]; then
+		# ExFAT has no symlinks. Record the newest successful snapshot in a text file.
+		fn_state_write "$(basename -- "$DEST")" "$LATEST_FILE"
+
+		# Remove .inprogress file only when rsync succeeded
+		fn_rm_file "$INPROGRESS_FILE"
+	fi
+
+	exit $EXIT_CODE
+done
