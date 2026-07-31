@@ -98,6 +98,7 @@ test_new_snapshot() {
 	run_backup "$SOURCE_DIR" "$DEST_DIR"
 
 	assert_status "new snapshot succeeds" 0
+	assert_contains "current project version is reported" "$LAST_OUTPUT" "Version: 3.4 ExFAT compatible"
 	assert "latest.txt is written" test -f "$DEST_DIR/latest.txt"
 	assert "new snapshot contains source data" test -f "$(latest_snapshot_path)/keep.txt"
 	assert "completed run removes backup.inprogress" test ! -e "$DEST_DIR/backup.inprogress"

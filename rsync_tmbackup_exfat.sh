@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 
 APPNAME=$(basename "$0" | sed "s/\.sh$//")
+VERSION="3.4"
 # ExFAT timestamped snapshot variant: full copies, resumable, no hard links/link-dest.
 
 # -----------------------------------------------------------------------------
@@ -519,7 +520,7 @@ fi
 # Setup additional variables
 # -----------------------------------------------------------------------------
 
-fn_log_info "Version: 2.3 ExFAT compatible"
+fn_log_info "Version: $VERSION ExFAT compatible"
 fn_log_info "Hard links/link-dest: disabled"
 fn_log_info "Expiration: disabled; existing snapshots will not be deleted"
 

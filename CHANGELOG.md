@@ -7,6 +7,11 @@ for provenance, naming notes, and known ambiguities.
 
 ## Unreleased
 
+### Changed
+
+- Normalized the supported ExFAT script's displayed project version to v3.4.
+- Marked `rsync_tmbackup_exfat.sh` executable for direct command-line use.
+
 ### Documentation
 
 - Reconstructed the historical v2.1-v3.4 sequence from the versioned scripts
