@@ -23,6 +23,10 @@ for provenance, naming notes, and known ambiguities.
 - Added standard-filesystem regression coverage for hard-linked incrementals,
   interrupted recovery, exclusions, `--resume-last`, safety checks, and flag
   parity with the ExFAT script.
+- Added RTB-010 profile format v1, repeatable profile selection, deterministic
+  chaining/merge behavior, cycle detection, fixtures, and resolver tests.
+- Added RTB-011 Profile, Destination, and Job concepts as future-facing schema
+  documentation without changing destination or job execution behavior.
 
 ### Documentation
 

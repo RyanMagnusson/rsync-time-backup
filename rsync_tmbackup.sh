@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 
 APPNAME=$(basename "$0" | sed "s/\.sh$//")
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # -----------------------------------------------------------------------------
 # Log functions
@@ -26,7 +27,14 @@ fn_terminate_script() {
 	exit 1
 }
 
+fn_cleanup_profile_temp() {
+	if [ -n "${PROFILE_TEMP_DIR:-}" ] && [ -d "$PROFILE_TEMP_DIR" ]; then
+		rm -rf -- "$PROFILE_TEMP_DIR"
+	fi
+}
+
 trap 'fn_terminate_script' SIGINT
+trap 'fn_cleanup_profile_temp' EXIT
 
 # -----------------------------------------------------------------------------
 # Small utility functions for reducing code duplication
@@ -55,6 +63,8 @@ fn_display_usage() {
 	echo " --no-auto-expire       Disable automatically deleting backups when out of space. Instead an error"
 	echo "                        is logged, and the backup is aborted."
 	echo " --exclude-from FILE    Read rsync exclude patterns from FILE. May appear before or after paths."
+	echo " --profile PROFILE      Apply a backup profile. Repeat to compose profiles."
+	echo " --profiles-dir DIR     Directory used to resolve named profiles."
 	echo " --resume-last          Add new and changed files to the snapshot referenced by latest."
 	echo "                        Default exclude file, when present: $DEFAULT_EXCLUDE_FILE"
 	echo ""
@@ -303,6 +313,11 @@ RESUME_LAST="0"
 RSYNC_FLAGS="-D --numeric-ids --links --hard-links --one-file-system --itemize-changes --times --recursive --perms --owner --group --stats --human-readable --partial --partial-dir=.rsync-partial"
 DEFAULT_EXCLUDE_FILE="$HOME/.config/rsync_tmbackup/excludes.txt"
 EXCLUDE_FROM_FILE=""
+PROFILES_DIR="${RTB_PROFILES_DIR:-$SCRIPT_DIR/profiles}"
+PROFILE_ARGS=()
+PROFILE_TEMP_DIR=""
+PROFILE_INCLUDES_FILE=""
+PROFILE_EXCLUDES_FILE=""
 
 # Parse options in any order. The first two non-option arguments are
 # SOURCE and DESTINATION; a third non-option argument remains supported as
@@ -351,6 +366,28 @@ while [ "$#" -gt 0 ]; do
 			;;
 		--exclude-from=*)
 			EXCLUDE_FROM_FILE="${1#*=}"
+			shift
+			continue
+			;;
+		--profile)
+			[ "$#" -ge 2 ] || { fn_log_error "--profile requires a name or file path."; exit 1; }
+			PROFILE_ARGS+=("$2")
+			shift 2
+			continue
+			;;
+		--profile=*)
+			PROFILE_ARGS+=("${1#*=}")
+			shift
+			continue
+			;;
+		--profiles-dir)
+			[ "$#" -ge 2 ] || { fn_log_error "--profiles-dir requires a directory path."; exit 1; }
+			PROFILES_DIR="$2"
+			shift 2
+			continue
+			;;
+		--profiles-dir=*)
+			PROFILES_DIR="${1#*=}"
 			shift
 			continue
 			;;
@@ -422,6 +459,18 @@ fi
 if [ -z "$EXCLUDE_FROM_FILE" ] && [ -f "$DEFAULT_EXCLUDE_FILE" ]; then
 	EXCLUDE_FROM_FILE="$DEFAULT_EXCLUDE_FILE"
 fi
+
+if [ "${#PROFILE_ARGS[@]}" -gt 0 ]; then
+	PROFILE_TEMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/rsync-tmbackup-profiles.XXXXXX")" || exit 1
+	PROFILE_INCLUDES_FILE="$PROFILE_TEMP_DIR/includes"
+	PROFILE_EXCLUDES_FILE="$PROFILE_TEMP_DIR/excludes"
+	# shellcheck source=lib/profile_resolver.sh
+	. "$SCRIPT_DIR/lib/profile_resolver.sh"
+	if ! rtb_profiles_resolve "$PROFILES_DIR" "$PROFILE_INCLUDES_FILE" "$PROFILE_EXCLUDES_FILE" "${PROFILE_ARGS[@]}"; then
+		exit 1
+	fi
+	fn_log_info "Profiles: ${PROFILE_ARGS[*]}"
+fi
 if [ -n "$EXCLUDE_FROM_FILE" ]; then
 	if [ ! -f "$EXCLUDE_FROM_FILE" ] || [ ! -r "$EXCLUDE_FROM_FILE" ]; then
 		fn_log_error "Exclude file '$EXCLUDE_FROM_FILE' does not exist or is not readable."
@@ -470,7 +519,7 @@ fi
 # Now strip off last slash from source folder.
 SRC_FOLDER="${SRC_FOLDER%/}"
 
-for ARG in "$SRC_FOLDER" "$DEST_FOLDER" "$EXCLUDE_FROM_FILE"; do
+for ARG in "$SRC_FOLDER" "$DEST_FOLDER" "$EXCLUDE_FROM_FILE" "$PROFILE_INCLUDES_FILE" "$PROFILE_EXCLUDES_FILE"; do
 	if [[ "$ARG" == *"'"* ]]; then
 		fn_log_error 'Source and destination directories may not contain single quote characters.'
 		exit 1
@@ -682,6 +731,12 @@ while : ; do
 	CMD="$CMD --log-file '$LOG_FILE'"
 	if [ -n "$EXCLUDE_FROM_FILE" ]; then
 		CMD="$CMD --exclude-from='$EXCLUDE_FROM_FILE'"
+	fi
+	if [ -n "$PROFILE_EXCLUDES_FILE" ]; then
+		CMD="$CMD --exclude-from='$PROFILE_EXCLUDES_FILE'"
+	fi
+	if [ -n "$PROFILE_INCLUDES_FILE" ] && [ -s "$PROFILE_INCLUDES_FILE" ]; then
+		CMD="$CMD --include-from='$PROFILE_INCLUDES_FILE' --exclude='*'"
 	fi
 	CMD="$CMD $LINK_DEST_OPTION"
 	CMD="$CMD -- '$SSH_SRC_FOLDER_PREFIX$SRC_FOLDER/' '$SSH_DEST_FOLDER_PREFIX$DEST/'"

@@ -36,6 +36,8 @@ On macOS, it has a few disadvantages compared to Time Machine - in particular it
 	 --no-auto-expire       Disable automatically deleting backups when out of space. Instead an error
 	                        is logged, and the backup is aborted.
 	 --exclude-from FILE    Read rsync exclude patterns from FILE. May appear before or after paths.
+	 --profile PROFILE      Apply a backup profile. Repeat to compose profiles.
+	 --profiles-dir DIR     Directory used to resolve named profiles.
 	 --resume-last          Add new and changed files to the snapshot referenced by latest.
 
 The standard and ExFAT scripts accept the same command-line flags. Their
@@ -129,6 +131,8 @@ See [`examples/excludes.txt`](examples/excludes.txt) for a starter file.
 
 * Exclude file - support for pattern-based exclusion via the `--exclude-from` rsync parameter.
 
+* Reusable, chainable backup profiles with include and exclude rules.
+
 * Automatically purge old backups - within 24 hours, all backups are kept. Within one month, the most recent backup for each day is kept. For all previous backups, the most recent of each month is kept.
 
 * "latest" symlink that points to the latest successful backup.
@@ -170,6 +174,20 @@ Before the first interval (i.e. by default within the first 24h) it is implied t
 
 An optional exclude file can be provided as a third parameter. It should be compatible with the `--exclude-from` parameter of rsync. See [this tutorial](https://web.archive.org/web/20230126121643/https://sites.google.com/site/rsync2u/home/rsync-tutorial/the-exclude-from-option) for more information.
 
+## Backup profiles
+
+Profiles provide reusable include/exclude sets without replacing any existing
+arguments. Select one or more with repeatable `--profile` options:
+
+```sh
+./rsync_tmbackup.sh --profile developer --profile personal /home/me /mnt/backup
+```
+
+Named profiles are read from `profiles/` by default. Use `--profiles-dir` for
+personal profiles. See [Backup profiles](docs/profiles.md) for the version 1
+format, chaining and merge semantics. The related roadmap work is tracked in
+[RTB-010 and RTB-011](docs/roadmap.md).
+
 ## Built-in lock
 
 The script is designed so that only one backup operation can be active for a given directory. If a new backup operation is started while another is still active (i.e. it has not finished yet), the new one will be automaticalled interrupted. Thanks to this the use of `flock` to run the script is not necessary.
@@ -200,6 +218,7 @@ Run both regression suites on a system with Bash and rsync:
 ```sh
 tests/test_standard.sh
 tests/test_exfat.sh
+tests/test_profiles.sh
 ```
 
 The suites use isolated temporary source and destination directories. They
