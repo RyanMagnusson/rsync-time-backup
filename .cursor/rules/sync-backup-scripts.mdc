@@ -1,0 +1,39 @@
+---
+description: Keep the standard and ExFAT backup scripts in sync unless the user opts out first
+globs: rsync_tmbackup*.sh
+alwaysApply: true
+---
+
+# Keep both backup scripts in sync
+
+`rsync_tmbackup.sh` and `rsync_tmbackup_exfat.sh` are the two supported entry points. A change to shared behavior in one is incomplete until the other script has the matching change.
+
+## Required behavior
+
+- In the same turn, port the shared change to the other script and to the matching test file (`tests/test_standard.sh` or `tests/test_exfat.sh`) when that behavior is covered there.
+- Do this unless the user explicitly said, before the edit, not to update the other script. Silence, or discovering a difference while editing, is not an opt-out.
+- When the user opts out, leave the other script untouched and say which change was left unsynced.
+
+## Keep these differences
+
+Do not copy filesystem-specific behavior across the scripts unless the user asked for that design change.
+
+Standard (`rsync_tmbackup.sh`):
+
+- Hard links and `--link-dest`. Default flags include `-D`, `--hard-links`, `--links`, `--perms`, `--owner`, and `--group`.
+- `latest` is a symlink, written only after rsync exits 0.
+- Interrupted recovery uses `backup.inprogress` and the newest timestamped directory. `--resume-last` is refused while that file exists.
+- Automatic expiration is on, including deleting the oldest snapshot when the disk is full.
+- With no older snapshot to hard-link, say the interrupted snapshot is being continued. Do not say a new backup is being created.
+
+ExFAT (`rsync_tmbackup_exfat.sh`):
+
+- Full independent copies. No hard links or `--link-dest`. Default flags use `--copy-links` and `--modify-window=2`, and omit `-D`, `--hard-links`, `--perms`, `--owner`, and `--group`.
+- `latest.txt` names the active snapshot and is written before rsync starts. There is no `latest` symlink.
+- Interrupted recovery requires both `backup.inprogress` and `latest.txt`. `--resume-last` updates the snapshot named by `latest.txt`.
+- Never automatically delete snapshots, including when the disk is full.
+
+```bash
+# Shared: both scripts must honor a non-zero rsync status
+RSYNC_EXIT_CODE=$?
+```

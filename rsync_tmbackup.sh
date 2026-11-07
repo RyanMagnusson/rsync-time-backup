@@ -755,6 +755,7 @@ while : ; do
 
 	fn_run_cmd "echo $MYPID > $INPROGRESS_FILE"
 	eval $CMD
+	RSYNC_EXIT_CODE=$?
 
 	# -----------------------------------------------------------------------------
 	# Check if we ran out of space
@@ -789,6 +790,8 @@ while : ; do
 	EXIT_CODE="1"
 	if [ -n "$(grep "rsync error:" "$LOG_FILE")" ]; then
 		fn_log_error "Rsync reported an error. Run this command for more details: grep -E 'rsync:|rsync error:' '$LOG_FILE'"
+	elif [ "$RSYNC_EXIT_CODE" -ne 0 ]; then
+		fn_log_error "Rsync exited with status $RSYNC_EXIT_CODE. The snapshot was left unfinished."
 	elif [ -n "$(grep "rsync:" "$LOG_FILE")" ]; then
 		fn_log_warn "Rsync reported a warning. Run this command for more details: grep -E 'rsync:|rsync error:' '$LOG_FILE'"
 	else

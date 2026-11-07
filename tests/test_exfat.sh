@@ -47,6 +47,17 @@ assert_contains() {
 	fi
 }
 
+assert_not_contains() {
+	local description="$1"
+	local haystack="$2"
+	local needle="$3"
+	if [[ "$haystack" != *"$needle"* ]]; then
+		pass "$description"
+	else
+		fail "$description" "expected output to omit: $needle"
+	fi
+}
+
 assert_status() {
 	local description="$1"
 	local expected="$2"
@@ -168,6 +179,41 @@ test_resume_last() {
 	assert "--resume-last does not create another snapshot" test "$(snapshot_count)" -eq 1
 }
 
+test_rsync_failure_leaves_snapshot_unfinished() {
+	new_case rsync-failure
+	mark_destination
+	printf 'new\n' > "$SOURCE_DIR/file.txt"
+	mkdir -p "$CASE_DIR/bin"
+	cat > "$CASE_DIR/bin/rsync" <<'EOF'
+#!/bin/sh
+log_file=""
+previous=""
+for arg in "$@"; do
+	if [ "$previous" = "--log-file" ]; then
+		log_file=$arg
+	fi
+	case "$arg" in
+		--log-file=*) log_file=${arg#--log-file=} ;;
+	esac
+	previous=$arg
+done
+if [ -n "$log_file" ]; then
+	: > "$log_file"
+fi
+echo "rsync(17990): error: unexpected end of file" >&2
+exit 1
+EOF
+	chmod +x "$CASE_DIR/bin/rsync"
+
+	PATH="$CASE_DIR/bin:$PATH" run_backup "$SOURCE_DIR" "$DEST_DIR"
+
+	assert_status "failed rsync is not reported as success" 1
+	assert_contains "failed rsync reports its exit status" "$LAST_OUTPUT" "Rsync exited with status 1. The snapshot was left unfinished."
+	assert_not_contains "failed rsync does not claim a clean completion" "$LAST_OUTPUT" "Backup completed without errors."
+	assert "failed rsync keeps the interrupted snapshot pending" test -f "$DEST_DIR/backup.inprogress"
+	assert "failed rsync does not copy the source file" test ! -e "$(latest_snapshot_path)/file.txt"
+}
+
 test_marker_safety() {
 	new_case marker-safety
 	printf 'data\n' > "$SOURCE_DIR/file.txt"
@@ -200,6 +246,7 @@ test_explicit_exclusions_after_paths
 test_default_exclusions
 test_interrupted_resume
 test_resume_last
+test_rsync_failure_leaves_snapshot_unfinished
 test_marker_safety
 test_invalid_resume_state
 

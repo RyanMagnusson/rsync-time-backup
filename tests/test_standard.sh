@@ -212,6 +212,45 @@ test_resume_last() {
 	assert "standard --resume-last does not create another snapshot" test "$(snapshot_count)" -eq 1
 }
 
+test_rsync_failure_leaves_snapshot_unfinished() {
+	new_case rsync-failure
+	mark_destination
+	local previous="2026-11-01-120000"
+	mkdir "$DEST_DIR/$previous"
+	ln -s "$previous" "$DEST_DIR/latest"
+	printf 'already copied\n' > "$DEST_DIR/$previous/file.txt"
+	printf 'new\n' > "$SOURCE_DIR/file.txt"
+	mkdir -p "$CASE_DIR/bin"
+	cat > "$CASE_DIR/bin/rsync" <<'EOF'
+#!/bin/sh
+log_file=""
+previous=""
+for arg in "$@"; do
+	if [ "$previous" = "--log-file" ]; then
+		log_file=$arg
+	fi
+	case "$arg" in
+		--log-file=*) log_file=${arg#--log-file=} ;;
+	esac
+	previous=$arg
+done
+if [ -n "$log_file" ]; then
+	: > "$log_file"
+fi
+echo "rsync(17990): error: unexpected end of file" >&2
+exit 1
+EOF
+	chmod +x "$CASE_DIR/bin/rsync"
+
+	PATH="$CASE_DIR/bin:$PATH" run_backup "$SOURCE_DIR" "$DEST_DIR"
+
+	assert_status "failed rsync is not reported as success" 1
+	assert_contains "failed rsync reports its exit status" "$LAST_OUTPUT" "Rsync exited with status 1. The snapshot was left unfinished."
+	assert_not_contains "failed rsync does not claim a clean completion" "$LAST_OUTPUT" "Backup completed without errors."
+	assert "failed rsync keeps the interrupted snapshot pending" test -f "$DEST_DIR/backup.inprogress"
+	assert "failed rsync keeps the previous latest snapshot" test "$(readlink "$DEST_DIR/latest")" = "$previous"
+}
+
 test_safety_and_flag_validation() {
 	new_case safety
 	printf 'data\n' > "$SOURCE_DIR/file.txt"
@@ -249,6 +288,7 @@ test_default_exclusions
 test_interrupted_resume
 test_nested_log_directory
 test_resume_last
+test_rsync_failure_leaves_snapshot_unfinished
 test_safety_and_flag_validation
 
 printf '\n%d passed, %d failed\n' "$PASSED" "$FAILED"
