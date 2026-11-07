@@ -2,7 +2,7 @@
 
 APPNAME=$(basename "$0" | sed "s/\.sh$//")
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-VERSION="3.4"
+VERSION="3.5"
 # ExFAT timestamped snapshot variant: full copies, resumable, no hard links/link-dest.
 
 # -----------------------------------------------------------------------------

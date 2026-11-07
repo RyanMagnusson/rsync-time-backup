@@ -47,6 +47,17 @@ assert_contains() {
 	fi
 }
 
+assert_not_contains() {
+	local description="$1"
+	local haystack="$2"
+	local needle="$3"
+	if [[ "$haystack" != *"$needle"* ]]; then
+		pass "$description"
+	else
+		fail "$description" "expected output to omit: $needle"
+	fi
+}
+
 assert_status() {
 	local description="$1"
 	local expected="$2"
@@ -105,6 +116,8 @@ test_incremental_snapshots() {
 
 	run_backup "$SOURCE_DIR" "$DEST_DIR"
 	assert_status "first standard snapshot succeeds" 0
+	assert_contains "standard project version is reported" "$LAST_OUTPUT" "Version: 3.5 standard filesystem"
+	assert_contains "first standard snapshot reports a new backup" "$LAST_OUTPUT" "No previous backup - creating new one."
 	local first_snapshot
 	first_snapshot="$(latest_snapshot_path)"
 
@@ -163,9 +176,24 @@ test_interrupted_resume() {
 
 	assert_status "standard interrupted snapshot resumes successfully" 0
 	assert_contains "standard automatic resume is reported" "$LAST_OUTPUT" "Backup will resume from there"
+	assert_contains "standard resume with no older snapshot names the interrupted snapshot" "$LAST_OUTPUT" "Continuing interrupted snapshot $DEST_DIR/$snapshot. No older snapshot to hard-link from."
+	assert_not_contains "standard resume with no older snapshot does not claim a new backup" "$LAST_OUTPUT" "No previous backup - creating new one."
 	assert "standard resume retains prior snapshot contents" test "$(snapshot_count)" -eq 1
 	assert "standard resume copies new data" test -f "$(latest_snapshot_path)/resumed.txt"
+	assert "standard resume preserves the original timestamp" test "$(readlink "$DEST_DIR/latest")" = "$snapshot"
+	assert "standard resume writes to the original directory" test -f "$DEST_DIR/$snapshot/resumed.txt"
 	assert "standard successful resume removes in-progress state" test ! -e "$DEST_DIR/backup.inprogress"
+}
+
+test_nested_log_directory() {
+	new_case nested-logs
+	mark_destination
+	LOG_DIR="$CASE_DIR/missing/parent/logs"
+	printf 'data\n' > "$SOURCE_DIR/file.txt"
+	run_backup "$SOURCE_DIR" "$DEST_DIR"
+	assert_status "nested log directory backup succeeds" 0
+	assert "missing log parents are created" test -d "$LOG_DIR"
+	assert "nested log directory contains a transfer log" test -n "$(find "$LOG_DIR" -name '*.log' -print)"
 }
 
 test_resume_last() {
@@ -219,6 +247,7 @@ test_incremental_snapshots
 test_explicit_exclusions_after_paths
 test_default_exclusions
 test_interrupted_resume
+test_nested_log_directory
 test_resume_last
 test_safety_and_flag_validation
 

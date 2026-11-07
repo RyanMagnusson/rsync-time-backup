@@ -2,6 +2,7 @@
 
 APPNAME=$(basename "$0" | sed "s/\.sh$//")
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+VERSION="3.5"
 
 # -----------------------------------------------------------------------------
 # Log functions
@@ -564,6 +565,8 @@ fi
 # Setup additional variables
 # -----------------------------------------------------------------------------
 
+fn_log_info "Version: $VERSION standard filesystem"
+
 # Date logic
 NOW=$(date +"%Y-%m-%d-%H%M%S")
 EPOCH=$(date "+%s")
@@ -576,6 +579,7 @@ PREVIOUS_DEST="$(fn_find_backups | head -n 1)"
 INPROGRESS_FILE="$DEST_FOLDER/backup.inprogress"
 LATEST_LINK="$DEST_FOLDER/latest"
 MYPID="$$"
+RESUMING_INTERRUPTED=0
 
 if [ "$RESUME_LAST" = "1" ]; then
 	if [ -n "$(fn_find "$INPROGRESS_FILE")" ]; then
@@ -614,7 +618,7 @@ fi
 
 if [ ! -d "$LOG_DIR" ]; then
 	fn_log_info "Creating log folder in '$LOG_DIR'..."
-	mkdir -- "$LOG_DIR"
+	mkdir -p -- "$LOG_DIR" || exit 1
 fi
 
 # -----------------------------------------------------------------------------
@@ -653,15 +657,16 @@ if [ "$RESUME_LAST" != "1" ] && [ -n "$(fn_find "$INPROGRESS_FILE")" ]; then
 	fi
 
 	if [ -n "$PREVIOUS_DEST" ]; then
-		# - Last backup is moved to current backup folder so that it can be resumed.
-		# - 2nd to last backup becomes last backup.
+		# Resume the newest (interrupted) snapshot under its original timestamp.
+		# Keep the second newest snapshot as the hard-link reference.
 		fn_log_info "$SSH_DEST_FOLDER_PREFIX$INPROGRESS_FILE already exists - the previous backup failed or was interrupted. Backup will resume from there."
-		fn_run_cmd "mv -- $PREVIOUS_DEST $DEST"
+		DEST="$PREVIOUS_DEST"
 		if [ "$(fn_find_backups | wc -l)" -gt 1 ]; then
 			PREVIOUS_DEST="$(fn_find_backups | sed -n '2p')"
 		else
 			PREVIOUS_DEST=""
 		fi
+		RESUMING_INTERRUPTED=1
 		# update PID to current process to avoid multiple concurrent resumes
 		fn_run_cmd "echo $MYPID > $INPROGRESS_FILE"
 	fi
@@ -676,7 +681,11 @@ while : ; do
 
 	LINK_DEST_OPTION=""
 	if [ -z "$PREVIOUS_DEST" ]; then
-		fn_log_info "No previous backup - creating new one."
+		if [ "$RESUMING_INTERRUPTED" = "1" ]; then
+			fn_log_info "Continuing interrupted snapshot $SSH_DEST_FOLDER_PREFIX$DEST. No older snapshot to hard-link from."
+		else
+			fn_log_info "No previous backup - creating new one."
+		fi
 	else
 		# If the path is relative, it needs to be relative to the destination. To keep
 		# it simple, just use an absolute path. See http://serverfault.com/a/210058/118679

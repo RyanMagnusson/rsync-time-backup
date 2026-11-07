@@ -9,6 +9,11 @@ for provenance, naming notes, and known ambiguities.
 
 ### Changed
 
+- Advanced both supported scripts to project version 3.5.
+- Ported ExFAT behavior to the standard script: display the project version,
+  create nested log directories, and resume interrupted snapshots under their
+  original timestamps while retaining the prior hard-link reference.
+
 - Normalized the supported ExFAT script's displayed project version to v3.4.
 - Marked `rsync_tmbackup_exfat.sh` executable for direct command-line use.
 - Removed the temporary `versions/`, `library/`, and mapping migration
